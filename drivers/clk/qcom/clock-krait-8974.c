@@ -22,6 +22,9 @@
 #include <linux/regulator/rpm-smd-regulator.h>
 #include <linux/of.h>
 #include <linux/cpumask.h>
+#ifdef CONFIG_CPU_VOLTAGE_CONTROL
+#include <linux/cpufreq.h>
+#endif
 #include <linux/clk/msm-clk-provider.h>
 #include <linux/clk/msm-clk.h>
 #include <linux/clk/msm-clock-generic.h>
@@ -45,7 +48,7 @@ static int hfpll_uv[] = {
 static DEFINE_VDD_REGULATORS(vdd_hfpll, ARRAY_SIZE(hfpll_uv)/2, 2,
 				hfpll_uv, NULL);
 
-static unsigned long hfpll_fmax[] = { 0, 998400000, 1996800000, 2900000000UL };
+static unsigned long hfpll_fmax[] = { 0, 998400000, 1996800000, 3100000000UL };
 
 static struct hfpll_data hdata = {
 	.mode_offset = 0x0,
@@ -59,7 +62,7 @@ static struct hfpll_data hdata = {
 	.user_val = 0x8,
 	.low_vco_max_rate = 1248000000,
 	.min_rate = 537600000UL,
-	.max_rate = 2900000000UL,
+	.max_rate = 3100000000UL,
 };
 
 static struct hfpll_clk hfpll0_clk = {
@@ -701,6 +704,80 @@ static void krait_update_uv(int *uv, int num, int boost_uv)
 			uv[i] += boost_uv;
 	}
 }
+
+#ifdef CONFIG_CPU_VOLTAGE_CONTROL
+
+#define CPU_VDD_MIN	 500
+#define CPU_VDD_MAX	 1450
+
+extern int use_for_scaling(unsigned int freq);
+
+ssize_t show_UV_mV_table(struct cpufreq_policy *policy, char *buf)
+{
+    int i, freq, len = 0;
+    /* use only master core 0 */
+    int num_levels = cpu_clk[0]->vdd_class->num_levels;
+    
+    /* sanity checks */
+    if (num_levels < 0)
+        return -EINVAL;
+    
+    if (!buf)
+        return -EINVAL;
+    
+    /* format UV_mv table */
+    for (i = 1; i < num_levels; i++) {
+        /* show only those used in scaling */
+        if (!use_for_scaling(freq = cpu_clk[0]->fmax[i] / 1000))
+            continue;
+        
+        len += sprintf(buf + len, "%d %u\n", freq,
+                       cpu_clk[0]->vdd_class->vdd_uv[i] / 1000);
+    }
+    return len;
+}
+
+ssize_t store_UV_mV_table(struct cpufreq_policy *policy, char *buf,
+                          size_t count)
+{
+    int i, j;
+    int ret = 0;
+    unsigned int val;
+    char size_cur[8];
+    /* use only master core 0 */
+    int num_levels = cpu_clk[0]->vdd_class->num_levels;
+    
+    /* sanity checks */
+    if (num_levels < 0)
+        return -1;
+    
+    for (i = 1; i < num_levels; i++) {
+        if (!use_for_scaling(cpu_clk[0]->fmax[i] / 1000))
+            continue;
+        
+        ret = sscanf(buf, "%u", &val);
+        if (!ret)
+            return -EINVAL;
+        
+        /* bounds check */
+        val = min( max((unsigned int)val, (unsigned int)CPU_VDD_MIN),
+                  (unsigned int)CPU_VDD_MAX);
+		
+		//pr_info("[clock/store_UV_mV_table] level: %d, val: %d\n", i, val);
+        
+        /* apply it to all available cores */
+        for (j = 0; j < NR_CPUS; j++)
+            cpu_clk[j]->vdd_class->vdd_uv[i] = val * 1000;
+        
+        /* Non-standard sysfs interface: advance buf */
+        ret = sscanf(buf, "%s", size_cur);
+        buf += strlen(size_cur) + 1;
+    }
+    pr_warn("[clock/store_UV_mV_table] user voltage table modified\n");
+    
+    return count;
+}
+#endif
 
 static char table_name[] = "qcom,speedXX-pvsXX-bin-vXX";
 module_param_string(table_name, table_name, sizeof(table_name), S_IRUGO);

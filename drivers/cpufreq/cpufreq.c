@@ -555,6 +555,7 @@ static ssize_t store_scaling_freq_lock(struct cpufreq_policy *policy,
 	return count;
 }
 #endif
+
 /**
  * show_scaling_governor - show the current policy for the specified CPU
  */
@@ -723,6 +724,12 @@ static ssize_t show_bios_limit(struct cpufreq_policy *policy, char *buf)
 	return sprintf(buf, "%u\n", policy->cpuinfo.max_freq);
 }
 
+#ifdef CONFIG_CPU_VOLTAGE_CONTROL
+extern ssize_t show_UV_mV_table(struct cpufreq_policy *policy, char *buf);
+extern ssize_t store_UV_mV_table(struct cpufreq_policy *policy,
+				 const char *buf, size_t count);
+#endif
+
 cpufreq_freq_attr_ro_perm(cpuinfo_cur_freq, 0400);
 cpufreq_freq_attr_ro(cpuinfo_min_freq);
 cpufreq_freq_attr_ro(cpuinfo_max_freq);
@@ -736,6 +743,10 @@ cpufreq_freq_attr_ro(affected_cpus);
 cpufreq_freq_attr_ro(cpu_utilization);
 cpufreq_freq_attr_ro(cpu_load);
 cpufreq_freq_attr_rw(scaling_min_freq);
+#ifdef CONFIG_CPU_VOLTAGE_CONTROL
+cpufreq_freq_attr_rw(UV_mV_table);
+#endif
+
 cpufreq_freq_attr_rw(scaling_max_freq);
 #ifdef CONFIG_CPUFREQ_SIMPLESCALINGLOCK
 cpufreq_freq_attr_rw(scaling_governor_lock);
