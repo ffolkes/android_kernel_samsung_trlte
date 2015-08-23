@@ -27,6 +27,12 @@
 #include <linux/hrtimer.h>
 #include "governor.h"
 
+extern unsigned long sttg_gpufreq_mid_freq;
+extern unsigned long sttg_gpufreq_min_freq_cable;
+extern bool flg_power_cableattached;
+int flg_ctr_devfreq_max = 0;
+int flg_ctr_devfreq_mid = 0;
+
 static struct class *devfreq_class;
 
 /*
@@ -181,6 +187,8 @@ static struct devfreq_governor *find_devfreq_governor(const char *name)
 int update_devfreq(struct devfreq *devfreq)
 {
 	unsigned long freq;
+	unsigned long cur_freq;
+	unsigned long tmp_gpufreq_freq = 0;
 	int err = 0;
 	u32 flags = 0;
 
@@ -205,6 +213,45 @@ int update_devfreq(struct devfreq *devfreq)
 	 * min_freq
 	 */
 
+	if (flg_ctr_devfreq_max > 0) {
+		
+		//pr_info("[devfreq] flg_ctr_devfreq_max = %d, target: %ld, name: %s\n",
+		//		flg_ctr_devfreq_max, freq, devfreq->governor->name);
+		
+		freq = devfreq->max_freq;
+		
+		//pr_info("[devfreq] newfreq: %ld, name: %s, max: %ld, min: %ld\n",
+		//		freq, devfreq->governor->name, devfreq->max_freq, devfreq->min_freq);
+		
+	} else {
+		
+		// mid boost only applies to the gpu.
+		if (devfreq->profile->num_governor_data == 2){
+			
+			// if the cable is attached and we have a min freq.
+			if (flg_power_cableattached && sttg_gpufreq_min_freq_cable > 0) {
+				tmp_gpufreq_freq = sttg_gpufreq_min_freq_cable;
+			}
+			
+			// if the mid booster is active.
+			if (flg_ctr_devfreq_mid > 0 && sttg_gpufreq_mid_freq > 0) {
+				// apply the highest one.
+				tmp_gpufreq_freq = max(sttg_gpufreq_mid_freq, sttg_gpufreq_min_freq_cable);
+			}
+			
+			devfreq->profile->get_cur_freq(devfreq->dev.parent, &cur_freq);
+			
+			//pr_info("[devfreq] flg_ctr_devfreq_mid = %d, cur_freq: %ld, target: %ld, sttg: %ld, name: %s, cable: %d\n",
+			//		flg_ctr_devfreq_mid, cur_freq, freq, tmp_gpufreq_freq, devfreq->governor->name, flg_power_cableattached);
+			
+			// if the current (or target) gpu freq is below the new one, boost.
+			if (cur_freq < tmp_gpufreq_freq || (freq > 0 && freq < tmp_gpufreq_freq)) {
+				freq = tmp_gpufreq_freq;
+				//pr_info("[devfreq] bypass - newfreq: %ld\n", freq);
+			}
+		}
+	}
+
 	if (devfreq->min_freq && freq < devfreq->min_freq) {
 		freq = devfreq->min_freq;
 		flags &= ~DEVFREQ_FLAG_LEAST_UPPER_BOUND; /* Use GLB */
@@ -222,6 +269,9 @@ int update_devfreq(struct devfreq *devfreq)
 		if (devfreq_update_status(devfreq, freq))
 			dev_err(&devfreq->dev,
 				"Couldn't update frequency transition information.\n");
+
+	//pr_info("[devfreq] id: %d, name: %s, max: %ld, min: %ld, set: %ld\n",
+	//		devfreq->profile->num_governor_data, devfreq->governor->name, devfreq->max_freq, devfreq->min_freq, freq);
 
 	devfreq->previous_freq = freq;
 	return err;
