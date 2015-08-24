@@ -122,6 +122,28 @@ struct es705_api_access {
 static int network_type = NARROW_BAND;
 static int extra_volume = 0;
 
+extern void zzmoove_boost(int screen_state,
+						  int max_cycles, int mid_cycles, int allcores_cycles,
+						  int input_cycles, int devfreq_max_cycles, int devfreq_mid_cycles,
+						  int userspace_cycles);
+
+extern void vk_press_button(int keycode, bool delayed, bool force, bool elastic, bool powerfirst);
+extern void plasma_pu_entrytimeout_cancel(void);
+struct timeval time_voice_lastheard;
+struct timeval time_voice_lastirq;
+bool flg_voice_allowturnoff = false;
+extern void press_power(void);
+extern bool flg_power_suspended;
+extern bool sttg_voice_enableturnoff;
+extern bool sttg_voice_enableturnon;
+extern bool sttg_pu_allow_voice;
+extern bool sttg_pu_tamperevident;
+extern bool sttg_pu_warnled;
+extern bool pu_valid(void);
+extern void pu_setFrontLED(unsigned int mode);
+extern bool flg_pu_tamperevident;
+extern bool flg_pu_locktsp;
+
 /* Route state for Internal state management */
 enum es705_power_state {
 ES705_POWER_FW_LOAD,
@@ -218,6 +240,15 @@ u32 es705_streaming_cmds[4] = {
 	0x90250300,		/* ES705_SPI_INTF  */
 	0x90250100,		/* ES705_UART_INTF */
 };
+
+static void es705_presspower_work(struct work_struct * work_es705_presspower);
+static DECLARE_DELAYED_WORK(work_es705_presspower, es705_presspower_work);
+
+static void es705_presspower_work(struct work_struct * work_es705_presspower)
+{
+	pr_info("[es705/%s] pressing power\n", __func__);
+	press_power();
+}
 
 #define SAMSUNG_ES70X_RESTORE_STD_FW
 #if defined(SAMSUNG_ES70X_RESTORE_STD_FW)
@@ -2737,11 +2768,32 @@ static int es705_put_voice_wakeup_enable_value(struct snd_kcontrol *kcontrol,
 			0x9017e000, 0x90180002,
 			0xffffffff};
 	int match = 1;
+	struct timeval time_now;
+	int timesince_voice_lastirq = 0;
+	//int timesince_voice_lastheard = 0;
 #ifdef SEAMLESS_VOICE_WAKEUP
 	u32 vs_keyword_length_cmd = 0x902C0000 | (es705_priv.vs_keyword_length & 0xFFFF);
 #endif
 	unsigned int value = 0;
 
+if (sttg_voice_enableturnoff && ucontrol->value.integer.value[0] == 0) {
+		// check to see if it was recently off.
+		
+		do_gettimeofday(&time_now);
+		
+		timesince_voice_lastirq = (time_now.tv_sec - time_voice_lastirq.tv_sec) * MSEC_PER_SEC +
+								(time_now.tv_usec - time_voice_lastirq.tv_usec) / USEC_PER_MSEC;
+		
+		if (timesince_voice_lastirq > 2000 && timesince_voice_lastirq < 45000 && flg_voice_allowturnoff) {
+			pr_info("[es705/es705_put_voice_wakeup_enable_value] pressing power key in 500ms (timesince: %d)\n", timesince_voice_lastirq);
+			vk_press_button(158, false, true, false, false);
+			schedule_delayed_work(&work_es705_presspower, msecs_to_jiffies(500));
+		} else {
+			pr_info("[es705/es705_put_voice_wakeup_enable_value] would be pressing power key (timesince: %d)\n", timesince_voice_lastirq);
+		}
+		
+		do_gettimeofday(&time_voice_lastheard);
+	}
 	if (es705_priv.voice_wakeup_enable == ucontrol->value.integer.value[0]) {
 		dev_info(es705_priv.dev, "%s(): skip to set voice_wakeup_enable[%d->%ld]\n",
 			__func__, es705_priv.voice_wakeup_enable,
@@ -5124,6 +5176,38 @@ irqreturn_t es705_irq_event(int irq, void *irq_data)
 {
 	struct es705_priv *es705 = (struct es705_priv *)irq_data;
 	u32 cmd_stop[] = {0x9017e000, 0x90180000, 0xffffffff};
+
+	// TODO: add compiler tags
+	zzmoove_boost(0, 30, 40, 10, 0, 20, 0, 0);
+	pr_info("[es705/es705_irq_event] boosting wakeup\n");
+	
+	if (flg_power_suspended) {
+		
+		// cancel the entry timeout.
+		plasma_pu_entrytimeout_cancel();
+
+		if (flg_pu_locktsp && !sttg_pu_allow_voice && pu_valid() && sttg_pu_tamperevident) {
+			// if the screen is off, tampermode is set, and there was a voice wakeup, so trigger the tamper.
+
+			flg_pu_tamperevident = true;
+			printk(KERN_DEBUG"[es705/es705_irq_event] voice tampered!\n");
+
+			if (!sttg_pu_warnled) {
+				// only turn on the tamperled if the warnled isn't coming on,
+				// otherwise it'd set the led 2x in a row.
+				pu_setFrontLED(2); // 2 = tampered
+			}
+		}
+
+		if (sttg_voice_enableturnon) {
+			pr_info("[es705/es705_irq_event] forcing a wakeup\n");
+			press_power();
+		}
+		
+		do_gettimeofday(&time_voice_lastirq);
+		printk(KERN_DEBUG"[es705/es705_irq_event] flg_voice_allowturnoff=true\n");
+		flg_voice_allowturnoff = true;
+	}
 
 	mutex_lock(&es705->cvq_mutex);
 	dev_info(es705->dev, "%s(): %s mode, Interrupt event",
