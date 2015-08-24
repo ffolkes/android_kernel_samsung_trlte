@@ -20,6 +20,36 @@
 #include "wacom_i2c.h"
 #include "wacom_i2c_flash.h"
 
+extern bool sttg_epen_worryfree;
+extern unsigned int sttg_epen_fixedpressure;
+extern unsigned int sttg_epen_fixedminpressure;
+extern unsigned int sttg_epen_minpressure;
+extern unsigned int sttg_epen_vib_duration;
+extern unsigned int sttg_epen_vib_strength;
+extern bool sttg_epen_vib_on_move;
+extern bool sttg_epen_vib_on_exit;
+extern bool flg_pu_locktsp;
+extern bool flg_epen_tsp_block;
+extern bool flg_epen_turnedon;
+extern void zzmoove_boost(int screen_state,
+						  int max_cycles, int mid_cycles, int allcores_cycles,
+						  int input_cycles, int devfreq_max_cycles, int devfreq_mid_cycles,
+						  int userspace_cycles);
+extern void controlVibrator(unsigned int duration, unsigned int strength);
+
+extern unsigned int sttg_epen_out_key_code;
+extern bool sttg_epen_out_key_delay;
+
+extern unsigned int sttg_epen_out_screenoff_key_code;
+extern bool sttg_epen_out_screenoff_key_delay;
+extern bool sttg_epen_out_screenoff_powerfirst;
+
+extern bool sttg_epen_in_powerfirst;
+
+extern void vk_press_button(int keycode, bool delayed, bool force, bool elastic, bool powerfirst);
+extern void press_power(void);
+extern bool flg_power_suspended;
+
 int wacom_i2c_send(struct wacom_i2c *wac_i2c,
 			  const char *buf, int count, bool mode)
 {
@@ -452,6 +482,9 @@ static int keycode[] = {
 
 void wacom_i2c_softkey(struct wacom_i2c *wac_i2c, s16 key, s16 pressed)
 {
+	if (flg_pu_locktsp)
+		return;
+
 	if (wac_i2c->pen_prox) {
 		dev_info(&wac_i2c->client->dev,
 				"%s: prox:%d, run release_hover\n",
@@ -567,6 +600,22 @@ int wacom_i2c_coord(struct wacom_i2c *wac_i2c)
 		if (softkey) {
 			pressed = !!(data[5] & 0x40);
 			keycode = (data[5] & 0x30) >> 4;
+			x = ((u16) data[1] << 8) + (u16) data[2];
+			y = ((u16) data[3] << 8) + (u16) data[4];
+			
+			if (wac_i2c->wac_dt_data->x_invert)
+				x = wac_i2c->wac_query_data->x_max - x;
+			if (wac_i2c->wac_dt_data->y_invert)
+				y = wac_i2c->wac_query_data->y_max - y;
+			
+			if (wac_i2c->wac_dt_data->xy_switch) {
+				tmp = x;
+				x = y;
+				y = tmp;
+			}
+			
+			pr_info("[wacom] x: %d, y: %d. pressed: %d, keycode: %d\n", x, y, pressed, keycode);
+
 #ifdef USE_WACOM_BLOCK_KEYEVENT
 			if (wac_i2c->touch_pressed) {
 				if (pressed) {
@@ -640,11 +689,28 @@ int wacom_i2c_coord(struct wacom_i2c *wac_i2c)
 			y = tmp;
 		}
 
-		if (wacom_i2c_coord_range(wac_i2c, &x, &y)) {
+		if (sttg_epen_worryfree)
+			flg_epen_tsp_block = true;
+		
+		//pr_info("[wacom] x: %d, y: %d, pressure: %d, gain: %d, prox: %d, stylus: %d, rubber: %d, rdy: %d\n",
+		//		x, y, pressure, gain, prox, stylus, rubber, rdy);
+
+		if (!flg_pu_locktsp
+			&& wacom_i2c_coord_range(wac_i2c, &x, &y)) {
+
 			input_report_abs(wac_i2c->input_dev, ABS_X, x);
 			input_report_abs(wac_i2c->input_dev, ABS_Y, y);
-			input_report_abs(wac_i2c->input_dev,
-					 ABS_PRESSURE, pressure);
+
+			// if fixedpressure is set, use that, if not, then see if the pressure
+			// is below minpressure, otherwise just use the normal value.
+			if (sttg_epen_fixedpressure)
+				input_report_abs(wac_i2c->input_dev, ABS_PRESSURE, sttg_epen_fixedpressure);
+			else {
+				if (sttg_epen_fixedminpressure && pressure < sttg_epen_fixedminpressure)
+					input_report_abs(wac_i2c->input_dev, ABS_PRESSURE, sttg_epen_fixedminpressure);
+				else
+					input_report_abs(wac_i2c->input_dev, ABS_PRESSURE, pressure);
+			}
 
 #ifdef USE_WACOM_TILT_HEIGH
 			input_report_abs(wac_i2c->input_dev,
@@ -658,9 +724,19 @@ int wacom_i2c_coord(struct wacom_i2c *wac_i2c)
 				ABS_TILT_Y, tilt_y);
 #endif
 
-			input_report_key(wac_i2c->input_dev,
-					 BTN_STYLUS, stylus);
-			input_report_key(wac_i2c->input_dev, BTN_TOUCH, prox);
+			input_report_key(wac_i2c->input_dev, BTN_STYLUS, stylus);
+			
+			if (sttg_epen_minpressure
+				&& pressure < sttg_epen_minpressure) {
+				// we are below the threshold, so always release the touch.
+				input_report_key(wac_i2c->input_dev, BTN_TOUCH, 0);
+				//prox = 0;  // don't use this so vibration will bypass minpressure
+			} else {
+				input_report_key(wac_i2c->input_dev, BTN_TOUCH, prox);
+				if (sttg_epen_vib_on_move && sttg_epen_vib_duration)
+					controlVibrator(sttg_epen_vib_duration, sttg_epen_vib_strength);
+			}
+
 			input_report_key(wac_i2c->input_dev, wac_i2c->tool, 1);
 			input_sync(wac_i2c->input_dev);
 			wac_i2c->last_x = x;
@@ -670,6 +746,8 @@ int wacom_i2c_coord(struct wacom_i2c *wac_i2c)
 #ifdef USE_WACOM_BLOCK_KEYEVENT
 				wac_i2c->touch_pressed = true;
 #endif
+			if (sttg_epen_vib_duration)
+					controlVibrator(sttg_epen_vib_duration, sttg_epen_vib_strength);
 
 #if !defined(CONFIG_SAMSUNG_PRODUCT_SHIP)
 				dev_info(&wac_i2c->client->dev,
@@ -685,6 +763,9 @@ int wacom_i2c_coord(struct wacom_i2c *wac_i2c)
 				schedule_delayed_work(&wac_i2c->touch_pressed_work,
 					msecs_to_jiffies(wac_i2c->key_delay_time));
 #endif
+				if (sttg_epen_vib_on_exit && sttg_epen_vib_duration)
+					controlVibrator(sttg_epen_vib_duration, sttg_epen_vib_strength);
+
 				dev_info(&wac_i2c->client->dev,
 						"%s: released\n",
 						__func__);
@@ -705,7 +786,7 @@ int wacom_i2c_coord(struct wacom_i2c *wac_i2c)
 		}
 	} else {
 
-		if (wac_i2c->pen_prox) {
+		if (wac_i2c->pen_prox && !flg_pu_locktsp) {
 			/* input_report_abs(wac->input_dev,
 			   ABS_X, x); */
 			/* input_report_abs(wac->input_dev,
@@ -728,6 +809,13 @@ int wacom_i2c_coord(struct wacom_i2c *wac_i2c)
 			dev_info(&wac_i2c->client->dev,
 					"%s: is out\n",
 					__func__);
+
+			//pr_info("[wacom] out - last x: %d, last y: %d\n", wac_i2c->last_x, wac_i2c->last_y);
+			
+			// if the side-button is down when hovering stops, that means we should
+			// temporarily disable worryfree.
+			if (wac_i2c->side_pressed)
+				flg_epen_tsp_block = false;
 		}
 		wac_i2c->pen_prox = 0;
 		wac_i2c->pen_pressed = 0;
@@ -808,8 +896,74 @@ static void pen_insert_work(struct work_struct *work)
 		return;
 	wac_i2c->pen_insert = !gpio_get_value(wac_i2c->gpio_pen_insert);
 
+	// boost on remove.
+	if (!wac_i2c->pen_insert) {
+		// pen removed.
+		
+		// mode/max/mid/allcores/input/gpumax/gpumid/user
+		zzmoove_boost(0, 10, 0, 10, 50, 50, 0, 50);
+		
+		if (sttg_epen_worryfree)
+			flg_epen_tsp_block = true;
+		
+		if (flg_power_suspended) {
+			// screen is off.
+			
+			if (sttg_epen_out_screenoff_powerfirst) {
+				// instead of using vk_press_button()'s powerfirst mode,
+				// turn it on manually instead since the user might want
+				// to turn it on, but not input any action.
+				
+				press_power();
+				flg_epen_turnedon = true;
+			}
+			
+			// now, we need to do the action here too, since if we just turned
+			// the screen on, flg_screen_on will always be true now.
+			
+			if (sttg_epen_out_screenoff_key_code) {
+				
+				pr_info("[E-PEN] SCREEN-OFF TRIGGERED --[E-PEN REMOVED]--\n");
+				vk_press_button(sttg_epen_out_screenoff_key_code,
+							 sttg_epen_out_screenoff_key_delay,
+							 true,
+							 false,
+							 false);
+			}
+			
+		} else {
+			// screen is on. we're using an ELSE so only one action is performed.
+			
+			if (sttg_epen_out_key_code) {
+				
+				if (!flg_power_suspended) {
+					
+					pr_info("[E-PEN] TRIGGERED --[E-PEN REMOVED]--\n");
+					vk_press_button(sttg_epen_out_key_code,
+								 sttg_epen_out_key_delay,
+								 true,
+								 false,
+								 false);
+				}
+			}
+		}
+		
+	} else {
+		// pen inserted.
+		
+		flg_epen_tsp_block = false;
+		
+		if (!flg_power_suspended && sttg_epen_in_powerfirst && flg_epen_turnedon) {
+			// if the screen is on and the user wants to turn it off when inserted.
+			// but only do this if the epen turned the screen on in the first place.
+			
+			pr_info("[E-PEN] TRIGGERED --[E-PEN INSERTED]--\n");
+			press_power();
+		}
+	}
+
 	dev_info(&wac_i2c->client->dev, "%s: pen %s\n",
-		__func__, wac_i2c->pen_insert ? "instert" : "remove");
+		__func__, wac_i2c->pen_insert ? "insert" : "remove");
 
 	input_report_switch(wac_i2c->input_dev,
 		SW_PEN_INSERT, !wac_i2c->pen_insert);
