@@ -86,10 +86,24 @@ struct fts_touchkey fts_touchkeys[] = {
 #endif
 
 extern int get_lcd_attached(char*);
+
+extern void plasma_process_tsp_touch_enter(int finger, int touchcount);
+extern int plasma_process_tsp_touch_move(int finger, int x, int y, int pressure);
+extern void plasma_process_tsp_touch_exit(int finger, int touchcount, int x, int y, int pressure);
+extern bool plasma_tsp_check_to_stay_on(void);
+extern int plasma_inject_tsp_x;
+extern int plasma_inject_tsp_y;
+extern bool flg_voice_allowturnoff;
+extern int s2w_switch;
+extern unsigned int ctr_power_suspends;
+
 extern int boot_mode_recovery;
 #ifdef CONFIG_SAMSUNG_LPM_MODE
 extern int poweroff_charging;
 #endif
+
+static bool flg_enable_hover = false;
+//bool flg_tsp_always_on = false;  // depreciated
 
 #ifdef USE_OPEN_CLOSE
 static int fts_input_open(struct input_dev *dev);
@@ -119,6 +133,18 @@ static int fts_stop_device(struct fts_ts_info *info);
 static int fts_start_device(struct fts_ts_info *info);
 static int fts_irq_enable(struct fts_ts_info *info, bool enable);
 void fts_release_all_finger(struct fts_ts_info *info);
+
+static ssize_t enable_hover_store(struct device *dev,
+								  struct device_attribute *attr, const char *buf, size_t size);
+
+static ssize_t enable_hover_show(struct device *dev,
+								 struct device_attribute *attr, char *buf);
+
+static struct device_attribute tsp_attrs[] = {
+	__ATTR(enable_hover, (S_IRUGO | S_IWUSR | S_IWGRP),
+		   enable_hover_show,
+		   enable_hover_store),
+};
 
 #if defined(CONFIG_SECURE_TOUCH)
 static void fts_secure_touch_notify(struct fts_ts_info *info);
@@ -253,6 +279,49 @@ static ssize_t fts_secure_touch_show(struct device *dev,
 	return scnprintf(buf, PAGE_SIZE, "%u", val);
 }
 #endif
+
+static ssize_t enable_hover_show(struct device *dev,
+							   struct device_attribute *attr, char *buf)
+{
+	return sprintf(buf, "%d\n", flg_enable_hover);
+}
+
+static ssize_t enable_hover_store(struct device *dev,
+								struct device_attribute *attr, const char *buf, size_t size)
+{
+	struct fts_ts_info *info = dev_get_drvdata(dev);
+	unsigned int ret;
+	unsigned int data;
+	
+	ret = sscanf(buf, "%u\n", &data);
+	
+	if(ret && data >= 0) {
+		
+		if (data > 1)
+			data = 1;
+		
+		flg_enable_hover = data;
+		info->hover_enabled = data;
+		
+		pr_info("[tsp] STORE - flg_enable_hover has been set to: %d\n", data);
+	}
+	
+	return size;
+}
+
+static unsigned int plasma_lpm_override(void)
+{
+	if (plasma_tsp_check_to_stay_on() || ctr_power_suspends < 2) {
+		// if flag is set or we're on our ~first suspend, then stay on.
+		// we do this in anticipation of synapse turning something on
+		// after the screen times out that would have required flg_tsp_always_on.
+		pr_info("[tsp/plasma_lpm_override] lpm on\n");
+		return 1;
+	} else {
+		pr_info("[tsp/plasma_lpm_override] lpm off\n");
+		return 0;
+	}
+}
 
 static int fts_write_reg(struct fts_ts_info *info,
 		  unsigned char *reg, unsigned short num_com)
@@ -1060,6 +1129,8 @@ static unsigned char fts_event_handler_type_b(struct fts_ts_info *info,
 			info->hover_present = false;
 		}
 
+		//pr_info("[tsp] EventID: %d\n", EventID);
+
 		switch (EventID) {
 		case EVENTID_NO_EVENT:
 			dev_info(&info->client->dev, "%s: No Event\n", __func__);
@@ -1196,6 +1267,9 @@ static unsigned char fts_event_handler_type_b(struct fts_ts_info *info,
 
 			z = data[5 + EventNum * FTS_EVENT_SIZE];
 
+			//pr_info("[tsp/hover] finger: %d, x: %d, y: %d, z: %d\n",
+			//		TouchID, x, y, (255 - z));
+
 			input_mt_slot(info->input_dev, 0);
 			input_mt_report_slot_state(info->input_dev,
 						   MT_TOOL_FINGER, 1);
@@ -1222,19 +1296,27 @@ static unsigned char fts_event_handler_type_b(struct fts_ts_info *info,
 
 		case EVENTID_ENTER_POINTER:
 
-			if(info->fts_power_mode == FTS_POWER_STATE_LOWPOWER){
+			// don't ignore events if the screen is off.
+			/*if(info->fts_power_mode == FTS_POWER_STATE_LOWPOWER){
 				break;
-			}
+			}*/
 
+			// reset the voice flag since someone is using it.
+			flg_voice_allowturnoff = false;
 			info->touch_count++;
+				
+			plasma_process_tsp_touch_enter(TouchID, info->touch_count);
+				
+			//pr_info("[tsp] finger: %d IN eventid: %d\n", TouchID, EventID);
 
 		case EVENTID_MOTION_POINTER:
 
-			if(info->fts_power_mode == FTS_POWER_STATE_LOWPOWER){
+			// don't ignore events if the screen is off.
+            		/*if(info->fts_power_mode == FTS_POWER_STATE_LOWPOWER){
 				dev_err(&info->client->dev, "%s %d: low power mode\n", __func__, __LINE__);
 				fts_release_all_finger(info);
 				break;
-			}
+			}*/
 
 			if (info->touch_count == 0) {
 				dev_err(&info->client->dev, "%s %d: count 0\n", __func__, __LINE__);
@@ -1267,6 +1349,40 @@ static unsigned char fts_event_handler_type_b(struct fts_ts_info *info,
 #else
 			z = data[7 + EventNum * FTS_EVENT_SIZE];
 #endif
+			//pr_info("[tsp] eid: %d, finger: %d, x: %d, y: %d, bw: %d, bh: %d, sum: %d, palm: %d, z: %d\n",
+			//		EventID, TouchID, x, y, bw, bh, sumsize, palm, z);
+				
+			if (!plasma_process_tsp_touch_move(TouchID, x, y, max(bw, bh)))
+				break;
+
+			// todo: make this into a function.
+			if (plasma_inject_tsp_x > 0) {
+				
+				input_mt_slot(info->input_dev, TouchID);
+				input_mt_report_slot_state(info->input_dev, MT_TOOL_FINGER, 1 + (palm << 1));
+				input_report_key(info->input_dev, BTN_TOUCH, 1);
+				input_report_key(info->input_dev, BTN_TOOL_FINGER, 1);
+				input_report_abs(info->input_dev, ABS_MT_POSITION_X, plasma_inject_tsp_x);
+				input_report_abs(info->input_dev, ABS_MT_POSITION_Y, plasma_inject_tsp_y);
+				input_report_abs(info->input_dev, ABS_MT_TOUCH_MAJOR, max(bw, bh));
+				input_report_abs(info->input_dev, ABS_MT_TOUCH_MINOR, min(bw, bh));
+				//input_report_abs(info->input_dev, ABS_MT_SUMSIZE, sumsize);
+				input_report_abs(info->input_dev, ABS_MT_PALM, palm);
+				info->finger[TouchID].lx = plasma_inject_tsp_x;
+				info->finger[TouchID].ly = plasma_inject_tsp_y;
+				
+				input_sync(info->input_dev);
+				
+				pr_info("[tsp/move] INJECTED - eid: %d, finger: %d, x: %d, y: %d, bw: %d, bh: %d, sum: %d, palm: %d, z: %d\n",
+						EventID, TouchID, plasma_inject_tsp_x, plasma_inject_tsp_y, bw, bh, sumsize, palm, z);
+				
+				// reset, because we only want to inject once.
+				plasma_inject_tsp_x = -1;
+				
+				pr_info("[tsp/move] CURRENT - eid: %d, finger: %d, x: %d, y: %d, bw: %d, bh: %d, sum: %d, palm: %d, z: %d\n",
+						EventID, TouchID, x, y, bw, bh, sumsize, palm, z);
+			}
+
 			input_mt_slot(info->input_dev, TouchID);
 			input_mt_report_slot_state(info->input_dev,
 						   MT_TOOL_FINGER,
@@ -1296,9 +1412,10 @@ static unsigned char fts_event_handler_type_b(struct fts_ts_info *info,
 
 		case EVENTID_LEAVE_POINTER:
 
-			if(info->fts_power_mode == FTS_POWER_STATE_LOWPOWER){
+			// don't ignore events if the screen is off.
+			/*if(info->fts_power_mode == FTS_POWER_STATE_LOWPOWER){
 				break;
-			}
+        		}*/
 
 			if (info->touch_count <= 0) {
 				dev_err(&info->client->dev, "%s %d: count 0\n", __func__, __LINE__);
@@ -1307,6 +1424,41 @@ static unsigned char fts_event_handler_type_b(struct fts_ts_info *info,
 			}
 
 			info->touch_count--;
+
+			//pr_info("[tsp] finger: %d OUT eventid: %d\n", TouchID, EventID);
+			
+			// calculate touch data for plasma.
+			x = data[1 + EventNum * FTS_EVENT_SIZE] + ((data[2 + EventNum * FTS_EVENT_SIZE] & 0x0f) << 8);
+			y = ((data[2 + EventNum * FTS_EVENT_SIZE] & 0xf0) >> 4) + (data[3 + EventNum * FTS_EVENT_SIZE] << 4);
+			bw = data[4 + EventNum * FTS_EVENT_SIZE];
+			bh = data[5 + EventNum * FTS_EVENT_SIZE];
+				
+			plasma_process_tsp_touch_exit(TouchID, info->touch_count, x, y, max(bw, bh));
+				
+			// todo: make this into a function.
+			if (plasma_inject_tsp_x > 0) {
+				
+				input_mt_slot(info->input_dev, TouchID);
+				input_mt_report_slot_state(info->input_dev, MT_TOOL_FINGER, 1 + (palm << 1));
+				input_report_key(info->input_dev, BTN_TOUCH, 1);
+				input_report_key(info->input_dev, BTN_TOOL_FINGER, 1);
+				input_report_abs(info->input_dev, ABS_MT_POSITION_X, plasma_inject_tsp_x);
+				input_report_abs(info->input_dev, ABS_MT_POSITION_Y, plasma_inject_tsp_y);
+				input_report_abs(info->input_dev, ABS_MT_TOUCH_MAJOR, max(bw, bh));
+				input_report_abs(info->input_dev, ABS_MT_TOUCH_MINOR, min(bw, bh));
+				//input_report_abs(info->input_dev, ABS_MT_SUMSIZE, sumsize);
+				input_report_abs(info->input_dev, ABS_MT_PALM, palm);
+				info->finger[TouchID].lx = plasma_inject_tsp_x;
+				info->finger[TouchID].ly = plasma_inject_tsp_y;
+				
+				input_sync(info->input_dev);
+				
+				pr_info("[tsp/exit] INJECTED - eid: %d, finger: %d, x: %d, y: %d, bw: %d, bh: %d, sum: %d, palm: %d, z: %d\n",
+						EventID, TouchID, plasma_inject_tsp_x, plasma_inject_tsp_y, bw, bh, sumsize, palm, z);
+				
+				// reset, because we only want to inject once.
+				plasma_inject_tsp_x = -1;
+			}
 
 			input_mt_slot(info->input_dev, TouchID);
 
@@ -1489,14 +1641,14 @@ static unsigned char fts_event_handler_type_b(struct fts_ts_info *info,
 #endif
 
 #if !defined(CONFIG_SAMSUNG_PRODUCT_SHIP)
-		if (EventID == EVENTID_ENTER_POINTER)
-			dev_info(&info->client->dev,
+		if (EventID == EVENTID_ENTER_POINTER) {
+			/*dev_info(&info->client->dev,
 				"[P] tID:%d x:%d y:%d w:%d h:%d z:%d s:%d p:%d tc:%d tm:%d\n",
-				TouchID, x, y, bw, bh, z, sumsize, palm, info->touch_count, info->touch_mode);
-		else if (EventID == EVENTID_HOVER_ENTER_POINTER)
-			dev_info(&info->client->dev,
+				TouchID, x, y, bw, bh, z, sumsize, palm, info->touch_count, info->touch_mode);*/
+		} else if (EventID == EVENTID_HOVER_ENTER_POINTER) {
+			/*dev_info(&info->client->dev,
 				"[HP] tID:%d x:%d y:%d z:%d\n",
-				TouchID, x, y, z);
+				TouchID, x, y, z);*/
 #else
 		if (EventID == EVENTID_ENTER_POINTER) {
 			dev_info(&info->client->dev,
@@ -1504,28 +1656,27 @@ static unsigned char fts_event_handler_type_b(struct fts_ts_info *info,
 				TouchID,
 				location_detect(info, y, 1), location_detect(info, x, 0),
 				info->touch_count, info->touch_mode);
-		}
-		else if (EventID == EVENTID_HOVER_ENTER_POINTER)
+		} else if (EventID == EVENTID_HOVER_ENTER_POINTER) {
 			dev_info(&info->client->dev,
 				"[HP] tID:%d\n", TouchID);
 #endif
-		else if (EventID == EVENTID_LEAVE_POINTER) {
+		} else if (EventID == EVENTID_LEAVE_POINTER) {
 #if !defined(CONFIG_SAMSUNG_PRODUCT_SHIP)
-			dev_info(&info->client->dev,
+			/*dev_info(&info->client->dev,
 				"[R] tID:%d mc: %d tc:%d lx:%d ly:%d Ver[%02X%04X%01X%01X%01X]\n",
 				TouchID, info->finger[TouchID].mcount, info->touch_count,
 				info->finger[TouchID].lx, info->finger[TouchID].ly,
 				info->panel_revision, info->fw_main_version_of_ic,
-				info->flip_enable, info->mshover_enabled, info->mainscr_disable);
+				info->flip_enable, info->mshover_enabled, info->mainscr_disable);*/
 #else
-			dev_info(&info->client->dev,
+			/*dev_info(&info->client->dev,
 				"[R] tID:%d loc:%c%c mc: %d tc:%d Ver[%02X%04X%01X%01X%01X]\n",
 				TouchID,
 				location_detect(info, info->finger[TouchID].ly, 1),
 				location_detect(info, info->finger[TouchID].lx, 0),
 				info->finger[TouchID].mcount, info->touch_count,
 				info->panel_revision, info->fw_main_version_of_ic,
-				info->flip_enable, info->mshover_enabled, info->mainscr_disable);
+				info->flip_enable, info->mshover_enabled, info->mainscr_disable);*/
 #endif
 			info->finger[TouchID].mcount = 0;
 		}/* else if (EventID == EVENTID_HOVER_LEAVE_POINTER) {
@@ -1664,6 +1815,8 @@ static irqreturn_t fts_interrupt_handler(int irq, void *handle)
 
 	evtcount = 0;
 
+	//pr_info("[tsp] Event\n");
+
 	if (info->lowpower_mode) {
 		if (info->fts_power_mode == FTS_POWER_STATE_LOWPOWER_SUSPEND) {
 
@@ -1711,7 +1864,7 @@ static int fts_irq_enable(struct fts_ts_info *info,
 			return retval;
 
 		retval = request_threaded_irq(info->irq, NULL,
-				fts_interrupt_handler, IRQF_TRIGGER_LOW | IRQF_ONESHOT,
+				fts_interrupt_handler, IRQF_TRIGGER_LOW | IRQF_ONESHOT | IRQF_NO_SUSPEND,
 				FTS_TS_DRV_NAME, info);
 		if (retval < 0) {
 			dev_info(&info->client->dev,
@@ -2379,6 +2532,16 @@ static int fts_probe(struct i2c_client *client, const struct i2c_device_id *idp)
 	}
 #endif
 
+	for (i = 0; i < ARRAY_SIZE(tsp_attrs); i++) {
+		ret = sysfs_create_file(&info->input_dev->dev.kobj,
+								&tsp_attrs[i].attr);
+		if (ret < 0) {
+			dev_err(&info->client->dev,
+					"%s: Failed to create sysfs attributes\n",
+					__func__);
+		}
+	}
+
 #if defined(CONFIG_SECURE_TOUCH)
 	for (i = 0; i < ARRAY_SIZE(attrs); i++) {
 		ret = sysfs_create_file(&info->input_dev->dev.kobj,
@@ -2514,6 +2677,7 @@ static int fts_input_open(struct input_dev *dev)
 {
 	struct fts_ts_info *info = input_get_drvdata(dev);
 	int retval;
+	unsigned char regAdd[4] = {0xB0, 0x01, 0x29, 0x41};
 
 	dev_dbg(&info->client->dev, "%s\n", __func__);
 
@@ -2531,13 +2695,17 @@ static int fts_input_open(struct input_dev *dev)
 	tsp_debug_err(true, &info->client->dev, "FTS cmd after wakeup : h%d \n",
 			info->retry_hover_enable_after_wakeup);
 
-	if(info->retry_hover_enable_after_wakeup == 1){
-		unsigned char regAdd[4] = {0xB0, 0x01, 0x29, 0x41};
+	if(info->retry_hover_enable_after_wakeup == 1 || flg_enable_hover){
+		pr_info("[tsp] hover on\n");
 		fts_write_reg(info, &regAdd[0], 4);
 		fts_command(info, FTS_CMD_HOVER_ON);
 		info->hover_ready = false;
 		info->hover_enabled = true;
+		fts_command(info, FLUSHBUFFER);
 	}
+
+	info->fts_change_scan_rate(info, FTS_CMD_FAST_SCAN);
+
 out:
 	return retval;
 }
@@ -2545,12 +2713,24 @@ out:
 static void fts_input_close(struct input_dev *dev)
 {
 	struct fts_ts_info *info = input_get_drvdata(dev);
+	unsigned char Dly_regAdd[4] = {0xB0, 0x01, 0x72, 0x08};
 
 	dev_dbg(&info->client->dev, "%s\n", __func__);
 
 #ifdef USE_OPEN_DWORK
 	cancel_delayed_work(&info->open_work);
 #endif
+
+	if (flg_enable_hover) {
+		pr_info("[tsp] hover off\n");
+		fts_write_reg(info, &Dly_regAdd[0], 4);
+		fts_command(info, FTS_CMD_HOVER_OFF);
+		info->hover_enabled = false;
+		info->hover_ready = false;
+		fts_command(info, FLUSHBUFFER);
+	}
+	
+	info->fts_change_scan_rate(info, FTS_CMD_USLOW_SCAN);
 
 	fts_stop_device(info);
 
@@ -2794,6 +2974,10 @@ static void fts_secure_touch_stop(struct fts_ts_info *info, int blocking)
 
 static int fts_stop_device(struct fts_ts_info *info)
 {
+	pr_info("[tsp/fts_stop_device]\n");
+	
+	info->lowpower_mode = plasma_lpm_override();
+
 	dev_info(&info->client->dev, "%s %s\n",
 			__func__, info->lowpower_mode ? "enter low power mode" : "");
 
