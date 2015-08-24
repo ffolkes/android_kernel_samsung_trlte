@@ -28,6 +28,34 @@
 #include <mach/sec_debug.h>
 #endif
 
+extern int do_timesince(struct timeval time_start);
+extern unsigned int pu_recording_end(void);
+extern int plasma_process_gpio_button_state(int keycode, int state);
+extern void zzmoove_boost(int screen_state,
+						  int max_cycles, int mid_cycles, int allcores_cycles,
+						  int input_cycles, int devfreq_max_cycles, int devfreq_mid_cycles,
+						  int userspace_cycles);
+
+extern bool flg_power_suspended;
+extern bool sttg_pu_tamperevident;
+extern bool sttg_pu_warnled;
+extern bool sttg_tsp_blockpower;
+extern bool sttg_s2w_mode;
+extern bool sttg_a2w_mode;
+extern bool sttg_p2w_mode;
+extern unsigned int sttg_pu_blockpower;
+extern bool pu_valid(void);
+extern void pu_setFrontLED(unsigned int mode);
+extern bool flg_pu_tamperevident;
+extern bool flg_pu_locktsp;
+extern unsigned int ctr_power_suspends;
+
+struct timeval time_pressed_power;
+struct timeval time_pressed_powerbypass;
+static bool flg_skip_next = false;
+static bool flg_allow_next = false;
+static int ctr_powerpress = 0;
+struct input_dev *plasma_input_dev_qpnp;
 
 /* Common PNP defines */
 #define QPNP_PON_REVISION2(base)		(base + 0x01)
@@ -496,6 +524,63 @@ qpnp_pon_input_dispatch(struct qpnp_pon *pon, u32 pon_type)
 					cfg->key_code, pon_rt_sts);
 	key_status = pon_rt_sts & pon_rt_bit;
 
+	if (!plasma_process_gpio_button_state(cfg->key_code, key_status)) {
+		printk(KERN_DEBUG"[qpnp-power-on/qpnp_pon_input_dispatch] BLOCKED - keycode: %d, state: %d\n", cfg->key_code, key_status);
+		cfg->old_state = key_status;  // keep this up-to-date.
+		flg_skip_next = false;  // reset this, just in case it was active.
+		return 0;
+	}
+	
+	// TODO: fix this so the flag only affects the button that went down.
+	if (flg_skip_next) {
+		// avoid sending the key-up event.
+		flg_skip_next = false;
+		return 0;
+	}
+	
+	// do we need to block this power press?
+	if ((((pu_valid() && (sttg_pu_blockpower == 1 || sttg_pu_blockpower == 3)))  // for pu power lockout
+			|| (sttg_tsp_blockpower && (sttg_s2w_mode || sttg_a2w_mode || sttg_p2w_mode)))  // for generic power lockout (s2w, a2w, etc)
+		&& flg_power_suspended
+		&& !flg_allow_next
+		&& ctr_power_suspends > 1) {  // allow the first power press to deal with tsp weirdness
+		// block this press, but first check for multipress bypass.
+		
+		if (do_timesince(time_pressed_powerbypass) < 300) {
+			
+			// increment for valid press.
+			if (key_status)
+				ctr_powerpress++;
+			
+			pr_info("[qpnp-power-on/qpnp_pon_input_dispatch] ctr_powerpress: %d\n", ctr_powerpress);
+			
+			if (ctr_powerpress == 2) {
+				// allow this (3rd) press.
+				pr_info("[qpnp-power-on/qpnp_pon_input_dispatch] allowing press");
+				flg_allow_next = true;
+				goto passthrough;
+			}
+		} else {
+			// reset.
+			ctr_powerpress = 0;
+		}
+		
+		// update time.
+		do_gettimeofday(&time_pressed_powerbypass);
+		
+		return 0;
+passthrough:
+		;
+	}
+	
+	flg_allow_next = false;
+	
+	if (pu_recording_end() && (cfg->key_code == 116 || cfg->key_code == 114)) {
+		// pu was recording, drop this press and the next 0.
+		flg_skip_next = true;
+		return 0;
+	}
+
 	/* simulate press event in case release event occured
 	 * without a press event
 	 */
@@ -504,9 +589,51 @@ qpnp_pon_input_dispatch(struct qpnp_pon *pon, u32 pon_type)
 		input_sync(pon->pon_input);
 	}
 
+	pr_info("[qpnp-power-on] qpnp_pon_input_dispatch. code: %d status: %d\n", cfg->key_code, key_status);
+
 	input_report_key(pon->pon_input, cfg->key_code, key_status);
 	input_sync(pon->pon_input);
 	pr_info("[KEY] code(0x%02X), value(%d)\n", cfg->key_code, key_status);
+
+	// boost as fast as possible for power key, but let voldown be handled by inputbooster.
+	// also boost if release event occurred without a press.
+	if (cfg->key_code == 116 && (key_status || (!cfg->old_state && !key_status))) {
+		pr_info("[qpnp-power-on/qpnp_pon_input_dispatch] boosting for powerkey!\n");
+		zzmoove_boost(2, 10, 20, 20, 80, 10, 30, 0);
+		
+		// save when power was last pressed, for touchwake.
+		do_gettimeofday(&time_pressed_power);
+	}
+	
+	if (key_status && flg_pu_locktsp && pu_valid()) {
+		
+		// this press is during the input lock.
+		
+		if (flg_power_suspended && sttg_pu_tamperevident) {
+			// if the screen is off, tampermode is set, and power is being pressed, trigger the tamper.
+			
+			flg_pu_tamperevident = true;
+			printk(KERN_DEBUG"[qpnp-power-on/qpnp_pon_input_dispatch/pu] power tampered!\n");
+			
+			if (!sttg_pu_warnled) {
+				// only turn on the tamperled if the warnled isn't coming on,
+				// otherwise it'd set the led 2x in a row.
+				
+				pu_setFrontLED(2); // 2 = tampered
+			}
+			
+		}
+		
+		if (cfg->key_code == 116) {
+			// phone is in locked mode, disable power long-press.
+			// when we get this 1, immediately send 0.
+			
+			printk(KERN_INFO "[KEYS] input locked - not holding button, immediately sending 0\n");
+			input_report_key(pon->pon_input, cfg->key_code, 0);
+			input_sync(pon->pon_input);
+		}
+		
+	}
 
 	if((cfg->key_code == 116) && (pon_rt_sts & pon_rt_bit)){
 		pon->powerkey_state = 1;
@@ -872,6 +999,9 @@ qpnp_set_resin_wk_int(int en)
 		pr_err("Invalid config pointer\n");
 		return -EFAULT;
 	}
+
+	// always wake from voldown.
+	en = 1;
 
 	if (!en) {
 		disable_irq_wake(cfg->state_irq);
@@ -1261,6 +1391,8 @@ static int qpnp_pon_config_init(struct qpnp_pon *pon)
 		}
 	}
 
+	plasma_input_dev_qpnp = pon->pon_input;
+
 	for (i = 0; i < pon->num_pon_config; i++) {
 		cfg = &pon->pon_cfg[i];
 		/* Configure the pull-up */
@@ -1426,6 +1558,8 @@ static int qpnp_wake_enabled(const char *val, const struct kernel_param *kp)
 		pr_err("Invalid config pointer\n");
 		return -EFAULT;
 	}
+
+	pr_info("[qpnp-power-on/qpnp_wake_enabled] code: %d, wake_enabled: %d\n", cfg->key_code, wake_enabled);
 
 	if (!wake_enabled)
 		disable_irq_wake(cfg->state_irq);
