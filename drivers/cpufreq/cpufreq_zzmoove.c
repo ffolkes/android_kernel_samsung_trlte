@@ -608,13 +608,13 @@
 #endif
 
 // settings from main plasma module.
-unsigned long sttg_gpufreq_mid_freq = 0;
-unsigned int sttg_mediamode_mode = 0;
+extern unsigned long sttg_gpufreq_mid_freq;
+extern unsigned int sttg_mediamode_mode;
 
 // settings from msm_thermal.
-bool core_control_enabled = false;
-uint32_t cpus_offlined = 0;
-uint32_t limited_max_freq_thermal = 0;
+extern bool core_control_enabled;
+extern uint32_t cpus_offlined;
+extern uint32_t limited_max_freq_thermal;
 
 // Yank: enable/disable sysfs interface to display current zzmoove version
 #define ZZMOOVE_VERSION "1.0 beta4"
@@ -811,10 +811,10 @@ static char custom_profile[20] = "custom";			// ZZ: name to show in sysfs if any
 #define DEF_BATTERYAWARE_LIMITINPUTBOOSTING_BATTPCT	(0)
 
 // ff: various external variables
- int flg_ctr_devfreq_max = 0;
- int flg_ctr_devfreq_mid = 0;
- bool flg_power_cableattached = 0;
- unsigned int plasma_fuelgauge = 100;
+extern int flg_ctr_devfreq_max;
+extern  int flg_ctr_devfreq_mid;
+extern bool flg_power_cableattached;
+extern unsigned int plasma_fuelgauge;
 
 // ZZ: Sampling Down Momentum variables
 static unsigned int min_sampling_rate;				// ZZ: minimal possible sampling rate
