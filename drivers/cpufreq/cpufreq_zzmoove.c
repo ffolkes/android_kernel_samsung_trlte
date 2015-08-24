@@ -782,7 +782,7 @@ static char custom_profile[20] = "custom";			// ZZ: name to show in sysfs if any
 #define DEF_INPUTBOOST_TYPINGBOOSTER_FREQ (0) // ff: default freq to punch to when the typing booster is activated
 
 // ff: tmu
-#define DEF_TT_TRIPTEMP				(60) // ff: default trip cpu temp
+#define DEF_TT_TRIPTEMP				(58) // ff: default trip cpu temp
 
 // ff: cable settings
 #define DEF_CABLE_MIN_FREQ					(0)			// ff: default minimum freq to maintain while cable plugged in
@@ -8039,6 +8039,7 @@ static void tmu_check_work(struct work_struct * work_tmu_check)
 	long temp = 0;
 	int tmu_temp_delta = 0;
 	int tmu_temp_eventdelta = 0;
+	int tt_triptemp = 0;
 	/*int i = 0;
 	
 	for (i = 0; i < 11; i++){
@@ -8050,13 +8051,23 @@ static void tmu_check_work(struct work_struct * work_tmu_check)
 	// get temp.
 	tsens_dev.sensor_num = 1;
 	tsens_get_temp(&tsens_dev, &temp);
-	pr_info("[zzmoove/thermal] sensor: %d, value: %ld, battery: %d, battery_limit: %d, max_scaling_hard: %d [%d], freq_table_size: %d\n",
-			tsens_dev.sensor_num, temp, plasma_fuelgauge, batteryaware_current_freqlimit, system_freq_table[max_scaling_freq_hard].frequency, max_scaling_freq_hard, freq_table_size);
+	pr_info("[zzmoove/thermal] sensor: %d, value: %ld, battery: %d, battery_limit: %d, max_scaling_hard: %d [%d], freq_table_size: %d, cable: %d\n",
+			tsens_dev.sensor_num, temp, plasma_fuelgauge, batteryaware_current_freqlimit, system_freq_table[max_scaling_freq_hard].frequency, max_scaling_freq_hard, freq_table_size, flg_power_cableattached);
 	
 	tmu_temp_cpu = temp;
 	
+	if (dbs_tuners_ins.tt_triptemp > 0) {
+		// there is a trip temp set, but are we booted?
+		// if not yet booted, use an aggressively low value to prevent reboots.
+		if (flg_booted)
+			tt_triptemp = dbs_tuners_ins.tt_triptemp;
+		else
+			tt_triptemp = 50;
+	} else
+		tt_triptemp = dbs_tuners_ins.tt_triptemp;
+	
 	// check this first, since 99% of the time we'll stop here.
-	if (tmu_temp_cpu < dbs_tuners_ins.tt_triptemp || !dbs_tuners_ins.tt_triptemp) {
+	if (tmu_temp_cpu < tt_triptemp || !tt_triptemp) {
 		flg_ctr_tmu_overheating = 0;
 		tt_reset();
 		tmu_temp_cpu_last = temp;
@@ -8081,20 +8092,20 @@ static void tmu_check_work(struct work_struct * work_tmu_check)
 	if (flg_ctr_tmu_overheating < 1) {
 		// first run, not overheating.
 		
-		if (temp >= dbs_tuners_ins.tt_triptemp) {
+		if (temp >= tt_triptemp) {
 			flg_ctr_tmu_overheating = 1;
 			tmu_throttle_steps = 1;
 			ctr_tmu_falling = 0;
 			ctr_tmu_neutral = 0;
-			pr_info("[zzmoove/thermal] TRIPPED - was: %d, now: %d - throttledmax %d (%d mhz)\n",
-					tmu_temp_cpu_last, tmu_temp_cpu, tmu_throttle_steps, system_freq_table[max_scaling_freq_soft - tmu_throttle_steps].frequency);
+			pr_info("[zzmoove/thermal] TRIPPED - was: %d, now: %d - throttledmax %d (%d mhz), triptemp: %d\n",
+					tmu_temp_cpu_last, tmu_temp_cpu, tmu_throttle_steps, system_freq_table[max_scaling_freq_soft - tmu_throttle_steps].frequency, tt_triptemp);
 		}
 		
 	} else {
 		// another run of overheating.
 		
 		tmu_temp_delta = (tmu_temp_cpu - tmu_temp_cpu_last);
-		tmu_temp_eventdelta = (tmu_temp_cpu - dbs_tuners_ins.tt_triptemp);
+		tmu_temp_eventdelta = (tmu_temp_cpu - tt_triptemp);
 		
 		// determine direction.
 		if (tmu_temp_delta > 0) {
@@ -8104,8 +8115,8 @@ static void tmu_check_work(struct work_struct * work_tmu_check)
 			
 			tmu_throttle_steps = flg_ctr_tmu_overheating;
 			
-			pr_info("[zzmoove/thermal] RISING - was: %d, now: %d (delta: %d, eventdelta: %d) - throttledmax: %d (%d mhz)\n",
-					tmu_temp_cpu_last, tmu_temp_cpu, tmu_temp_delta, tmu_temp_eventdelta, tmu_throttle_steps, system_freq_table[max_scaling_freq_soft - tmu_throttle_steps].frequency);
+			pr_info("[zzmoove/thermal] RISING - was: %d, now: %d (delta: %d, eventdelta: %d) - throttledmax: %d (%d mhz), triptemp: %d\n",
+					tmu_temp_cpu_last, tmu_temp_cpu, tmu_temp_delta, tmu_temp_eventdelta, tmu_throttle_steps, system_freq_table[max_scaling_freq_soft - tmu_throttle_steps].frequency, tt_triptemp);
 			
 			ctr_tmu_falling = 0;
 			ctr_tmu_neutral = 0;
@@ -8116,7 +8127,7 @@ static void tmu_check_work(struct work_struct * work_tmu_check)
 			ctr_tmu_falling++;
 			ctr_tmu_neutral = 0;
 			
-			if (ctr_tmu_falling > 1 && tmu_temp_cpu <= (dbs_tuners_ins.tt_triptemp + 2)) {
+			if (ctr_tmu_falling > 1 && tmu_temp_cpu <= (tt_triptemp + 2)) {
 				
 				ctr_tmu_falling = 0;
 				
@@ -8148,7 +8159,7 @@ static void tmu_check_work(struct work_struct * work_tmu_check)
 			ctr_tmu_neutral++;
 			//ctr_tmu_falling = 0;
 			
-			if (ctr_tmu_neutral > 2 && tmu_temp_cpu >= (dbs_tuners_ins.tt_triptemp + 5)) {
+			if (ctr_tmu_neutral > 2 && tmu_temp_cpu >= (tt_triptemp + 5)) {
 				// if it has remained neutral for too long, throttle more.
 				
 				ctr_tmu_neutral = 0;
@@ -8272,7 +8283,7 @@ static void __cpuinit hotplug_online_work_fn(struct work_struct *work)
 	// check msm_thermal before bringing cores online, don't turn cores on if we're overheating.
 	if ((core_control_enabled && cpus_offlined > 0) || limited_max_freq_thermal > -1 || tmu_throttle_steps > 0) {
 		hotplug_up_in_progress = false;
-		pr_info("[zzmoove/hotplug_online_work_fn/msm_thermal] overheating, not bringing any cores online. %d cores offlined (%d mhz) by msm_thermal\n",
+		pr_info("[zzmoove/hotplug_online_work_fn/msm_thermal] overheating, not bringing any cores online. %d cores offlined (freq limit: %d) by msm_thermal\n",
                 cpus_offlined, limited_max_freq_thermal);
 		return;
 	}
