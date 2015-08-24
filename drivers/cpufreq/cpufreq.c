@@ -596,7 +596,7 @@ static ssize_t store_scaling_governor(struct cpufreq_policy *policy,
 		return -EINVAL;
 	}/*else
 		pr_info("[cpufreq/%s] governor lock off, allowing governor change to '%s' from '%s' for cpu %d\n",
-				__func__, str_governor, policy->governor->name, policy->cpu);
+				__func__, str_governor, policy->governor->name, policy->cpu);*/
 #endif
 
 	if (cpufreq_parse_governor(str_governor, &new_policy.policy,
@@ -2103,6 +2103,7 @@ static int cpufreq_set_policy(struct cpufreq_policy *policy,
 				struct cpufreq_policy *new_policy)
 {
 	int ret = 0, failed = 1;
+	struct cpufreq_policy *cpu0_policy = cpufreq_cpu_get(0);
 
 	pr_debug("setting new policy for CPU %u: %u - %u kHz\n", new_policy->cpu,
 		new_policy->min, new_policy->max);
