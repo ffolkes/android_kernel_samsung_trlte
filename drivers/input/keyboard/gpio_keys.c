@@ -36,6 +36,34 @@
 #endif
 #include <linux/sec_class.h>
 
+extern bool flg_power_suspended;
+extern int do_timesince(struct timeval time_start);
+extern unsigned int pu_recording_end(void);
+extern int plasma_process_gpio_button_state(int keycode, int state);
+extern void zzmoove_boost(int screen_state,
+						  int max_cycles, int mid_cycles, int allcores_cycles,
+						  int input_cycles, int devfreq_max_cycles, int devfreq_mid_cycles,
+						  int userspace_cycles);
+
+extern bool sttg_pu_tamperevident;
+extern bool sttg_pu_warnled;
+extern unsigned int sttg_gpio_key172_nohold;
+extern bool pu_valid(void);
+extern void pu_setFrontLED(unsigned int mode);
+extern bool flg_pu_tamperevident;
+extern bool flg_pu_locktsp;
+extern unsigned int sttg_pu_blockpower;
+//extern void mdnie_toggle_nightmode(void);
+
+struct timeval time_pressed_homekey;
+struct timeval time_pressed_home;
+static bool flg_skip_next = false;
+static int ctr_homepress = 0;
+struct input_dev *plasma_input_dev_gpio;
+static struct wake_lock wake_gpio;
+static void gpio_unwakelock_work(struct work_struct * work_gpio_unwakelock);
+static DECLARE_DELAYED_WORK(work_gpio_unwakelock, gpio_unwakelock_work);
+
 #if defined(CONFIG_SENSORS_HALL)
 static bool flip_cover;
 #endif
@@ -341,6 +369,12 @@ static struct attribute_group gpio_keys_attr_group = {
 
 int key_irq_state;
 
+static void gpio_unwakelock_work(struct work_struct * work_gpio_unwakelock)
+{
+	pr_info("[keys/gpio_unwakelock_work] dropping gpio wakelock\n");
+	wake_unlock(&wake_gpio);
+}
+
 static void gpio_keys_gpio_report_event(struct gpio_button_data *bdata)
 {
 	const struct gpio_keys_button *button = bdata->button;
@@ -353,6 +387,125 @@ static void gpio_keys_gpio_report_event(struct gpio_button_data *bdata)
 	 */
 	static int home_old_state;
 
+	if (state) {
+		// zzmoove_boost: mode/max/mid/allcores/input/gpumax/gpumid/user
+		if (flg_power_suspended) {
+			zzmoove_boost(0, 5, 10, 0, 0, 10, 0, 0);
+			wake_lock(&wake_gpio);
+			schedule_delayed_work(&work_gpio_unwakelock, msecs_to_jiffies(1000));
+		} else {
+			zzmoove_boost(0, 5, 10, 0, 50, 5, 0, 0);
+			wake_unlock(&wake_gpio);
+		}
+	}
+	
+	if (!plasma_process_gpio_button_state(button->code, state)) {
+		printk(KERN_DEBUG"[KEYS/plasma] BLOCKED - keycode: %d, state: %d\n", button->code, state);
+		home_old_state = state;  // keep this up-to-date.
+		flg_skip_next = false;  // reset this, just in case it was active.
+		return;
+	}
+	
+	if (flg_skip_next) {
+		// avoid sending the key-up event.
+		flg_skip_next = false;
+		return;
+	}
+	
+	if (pu_recording_end()) {
+		// pu was recording, drop this press and the next 0.
+		flg_skip_next = true;
+		return;
+	}
+	
+	if (button->code == KEY_HOMEPAGE && flg_pu_locktsp && pu_valid()) {
+		
+		if (flg_power_suspended && state) {
+			
+			if (sttg_pu_blockpower > 1) {
+				// modes 2 or 3.
+				// if we want to block home from turning the phone on, then do it now.
+				return;
+			}
+			
+			if (sttg_pu_tamperevident) {
+				// home key is being pressed and tampermode is set, but we have no way of knowing if this actuallly
+				// woke up the device. so make a timestamp, and compare it on resume.
+				
+				printk(KERN_DEBUG"[KEYS/pu] home tampered!\n");
+				do_gettimeofday(&time_pressed_homekey);
+			}
+			
+			// phone is in locked mode. when we get this 1, immediately send 0.
+			
+			input_event(input, type, KEY_HOMEPAGE, 1);
+			input_sync(input);
+			
+			input_event(input, type, KEY_HOMEPAGE, 0);
+			input_sync(input);
+			
+			key_irq_state = 0;
+			return;
+			
+		} else {
+			// screen is on, so block all presses.
+			return;
+		}
+	}
+	
+	// toggle night mode with three home button presses.
+	if (state && button->code == 172 && !flg_pu_locktsp) {
+		
+		// check to see if the 2nd press was fast enough (but not too fast, as that might be erroneous).
+		if (do_timesince(time_pressed_home) > 40
+			&& do_timesince(time_pressed_home) < 135) {
+			
+			// increment for valid press.
+			ctr_homepress++;
+			
+			pr_info("[KEYS/gpio_keys_gpio_report_event] ctr_powerpress: %d, timesince: %d\n",
+					ctr_homepress, do_timesince(time_pressed_home));
+			
+			if (ctr_homepress == 2) {
+				// this is the 3rd press.
+				pr_info("[KEYS/gpio_keys_gpio_report_event] toggling nightmode");
+				//mdnie_toggle_nightmode();
+			}
+			
+			// don't send button-up.
+			flg_skip_next = true;
+			
+			// update time.
+			do_gettimeofday(&time_pressed_home);
+			
+			// don't send input.
+			return;
+			
+		} else {
+			// reset.
+			pr_info("[KEYS/gpio_keys_gpio_report_event] reset - ctr_powerpress was: %d, timesince: %d\n",
+					ctr_homepress, do_timesince(time_pressed_home));
+			ctr_homepress = 1;
+		}
+		
+		// update time.
+		do_gettimeofday(&time_pressed_home);
+	}
+	
+	// boosts are handled by the inputbooster in zzmoove now.
+	/*if (state && button->code == 172) {
+		
+		if (flg_power_suspended) {
+			zzmoove_boost(0, 5, 10, 10, 10, 10, 0, 0);
+		} else {
+			zzmoove_boost(0, 10, 15, 10, 50, 25, 50, 0);
+		}
+		
+		pr_info("[KEY] boosted home press\n");
+		
+	} else {
+		pr_info("[KEY] not boosting power press (key: %d, state: %d)\n", button->code, state);
+	}*/
 
 	if (button->code == KEY_HOMEPAGE) {
 		if (!home_old_state && !state && key_irq_state ) {
@@ -376,6 +529,24 @@ static void gpio_keys_gpio_report_event(struct gpio_button_data *bdata)
 		input_event(input, type, button->code, !!state);
 	}
 	input_sync(input);
+
+	if (!flg_power_suspended && sttg_gpio_key172_nohold && state && button->code == KEY_HOMEPAGE) {
+		// if the home button was pressed,
+		// speed things up by immediately sending an up event.
+		
+		printk(KERN_INFO "[KEYS] not holding home, immediately sending 0\n");
+		
+		input_event(input, type, KEY_HOMEPAGE, 0);
+		input_sync(input);
+		
+		if (sttg_gpio_key172_nohold > 1) {
+			// allow press and hold.
+			printk(KERN_INFO "[KEYS] not holding home, immediately sending 1\n");
+			
+			input_event(input, type, KEY_HOMEPAGE, 1);
+			input_sync(input);
+		}
+	}
 }
 
 static void gpio_keys_gpio_work_func(struct work_struct *work)
@@ -542,6 +713,8 @@ static int gpio_keys_setup_key(struct platform_device *pdev,
 	 */
 	if (!button->can_disable)
 		irqflags |= IRQF_SHARED;
+
+	irqflags |= IRQF_NO_SUSPEND;
 
 	error = request_any_context_irq(bdata->irq, isr, irqflags, desc, bdata);
 	if (error < 0) {
@@ -916,10 +1089,10 @@ static ssize_t wakeup_enable(struct device *dev,
 	for (i = 0; i < ddata->pdata->nbuttons; i++) {
 		struct gpio_button_data *button = &ddata->data[i];
 		if (button->button->type == EV_KEY) {
-			if (test_bit(button->button->code, bits))
+			//if (test_bit(button->button->code, bits))
 				button->button->wakeup = 1;
-			else
-				button->button->wakeup = 0;
+			//else
+			//	button->button->wakeup = 0;
 			pr_info("%s wakeup status %d\n", button->button->desc,\
 					button->button->wakeup);
 		}
@@ -996,7 +1169,7 @@ static int gpio_keys_probe(struct platform_device *pdev)
 		if (error)
 			goto fail2;
 
-		if (button->wakeup)
+		//if (button->wakeup)
 			wakeup = 1;
 	}
 
@@ -1028,6 +1201,8 @@ static int gpio_keys_probe(struct platform_device *pdev)
 		goto fail3;
 	}
 
+	plasma_input_dev_gpio = input;
+
 	ret = device_create_file(sec_key, &dev_attr_sec_key_pressed);
 	if (ret) {
 		pr_err("Failed to create device file in sysfs entries(%s)!\n",
@@ -1048,6 +1223,8 @@ static int gpio_keys_probe(struct platform_device *pdev)
 	dev_set_drvdata(sec_key, ddata);
 
 	device_init_wakeup(&pdev->dev, wakeup);
+
+	wake_lock_init(&wake_gpio, WAKE_LOCK_SUSPEND, "wake_plasma_gpio");
 
 	return 0;
 
