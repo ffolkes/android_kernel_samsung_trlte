@@ -45,6 +45,7 @@ extern bool sttg_epen_out_screenoff_key_delay;
 extern bool sttg_epen_out_screenoff_powerfirst;
 
 extern bool sttg_epen_in_powerfirst;
+extern bool sttg_epen_out_vibrate;
 
 extern void vk_press_button(int keycode, bool delayed, bool force, bool elastic, bool powerfirst);
 extern void press_power(void);
@@ -905,6 +906,9 @@ static void pen_insert_work(struct work_struct *work)
 		
 		if (sttg_epen_worryfree)
 			flg_epen_tsp_block = true;
+		
+		if (sttg_epen_out_vibrate)
+			controlVibrator(100, 100);
 		
 		if (flg_power_suspended) {
 			// screen is off.
