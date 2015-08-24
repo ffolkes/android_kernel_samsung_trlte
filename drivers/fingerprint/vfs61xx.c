@@ -26,6 +26,12 @@
 #include <mach/gpio.h>
 #endif
 
+extern void zzmoove_boost(int screen_state,
+						  int max_cycles, int mid_cycles, int allcores_cycles,
+						  int input_cycles, int devfreq_max_cycles, int devfreq_mid_cycles,
+						  int userspace_cycles);
+
+struct vfsspi_devData *vfsSpiDev_copy = NULL;
 
 /* Pass to VFSSPI_IOCTL_GET_FREQ_TABLE command */
 /**
@@ -669,6 +675,21 @@ static void vfsspi_gpio_config(struct vfsspi_devData *data, int onoff)
 }
 #endif
 
+void vfs_mode(unsigned int mode)
+{
+	mutex_lock(&vfsSpiDev_copy->bufferMutex);
+	if (mode) {
+		// turn on.
+		pr_info("[vfs] on\n");
+		if (vfsSpiDev_copy->ldocontrol && !vfsSpiDev_copy->ldo_onoff
+			&& !vfsSpiDev_copy->ocp_state) {
+			vfsspi_regulator_onoff(vfsSpiDev_copy, true);
+		}
+	}
+	mutex_unlock(&vfsSpiDev_copy->bufferMutex);
+}
+EXPORT_SYMBOL(vfs_mode);
+
 long vfsspi_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	int retVal = 0;
@@ -686,6 +707,8 @@ long vfsspi_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 
 	pr_debug("%s\n", __func__);
 
+	pr_info("[vfs] vfsspi_ioctl - cmd: %d, arg: %ld\n", cmd, arg);
+
 	if (_IOC_TYPE(cmd) != VFSSPI_IOCTL_MAGIC) {
 		pr_err("%s invalid cmd= 0x%X Received= 0x%X Expected= 0x%X\n",
 			__func__, cmd, _IOC_TYPE(cmd), VFSSPI_IOCTL_MAGIC);
@@ -693,23 +716,24 @@ long vfsspi_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	}
 
 	vfsSpiDev = filp->private_data;
+	vfsSpiDev_copy = vfsSpiDev;
 
 	mutex_lock(&vfsSpiDev->bufferMutex);
 
 	switch (cmd) {
 
 	case VFSSPI_IOCTL_DEVICE_SUSPEND:
-		pr_debug("VFSSPI_IOCTL_DEVICE_SUSPEND:\n");
+		pr_info("VFSSPI_IOCTL_DEVICE_SUSPEND:\n");
 		vfsspi_suspend(vfsSpiDev);
 		break;
 
 	case VFSSPI_IOCTL_DEVICE_RESET:
-		pr_debug("%s VFSSPI_IOCTL_DEVICE_RESET:\n", __func__);
-		vfsspi_hardReset(vfsSpiDev);
+		pr_info("%s VFSSPI_IOCTL_DEVICE_RESET:\n", __func__);
+		//vfsspi_hardReset(vfsSpiDev);
 		break;
 #ifndef ENABLE_SENSORS_FPRINT_SECURE
 	case VFSSPI_IOCTL_RW_SPI_MESSAGE:
-		pr_debug("%s VFSSPI_IOCTL_RW_SPI_MESSAGE\n", __func__);
+		pr_info("%s VFSSPI_IOCTL_RW_SPI_MESSAGE\n", __func__);
 		dup = kmalloc(sizeof(struct vfsspi_iocTransfer), GFP_KERNEL);
 		if (dup != NULL) {
 			if (copy_from_user(dup, (void *)arg,
@@ -736,7 +760,7 @@ long vfsspi_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 #endif
 
 	case VFSSPI_IOCTL_SET_CLK:
-		pr_debug("%s VFSSPI_IOCTL_SET_CLK", __func__);
+		pr_info("%s VFSSPI_IOCTL_SET_CLK", __func__);
 		if (copy_from_user(&clock, (void *)arg,
 		     sizeof(unsigned short)) == 0) {
 
@@ -820,7 +844,7 @@ long vfsspi_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 #ifndef ENABLE_SENSORS_FPRINT_SECURE
 	case VFSSPI_IOCTL_CHECK_DRDY:
 		retVal = -ETIMEDOUT;
-		pr_debug("%s: VFSSPI_IOCTL_CHECK_DRDY",
+		pr_info("%s: VFSSPI_IOCTL_CHECK_DRDY",
 			__func__);
 		dataToRead = 0;
 
@@ -875,7 +899,7 @@ long vfsspi_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 
 #ifndef ENABLE_SENSORS_FPRINT_SECURE
 	case VFSSPI_IOCTL_SET_USER_DATA:
-		pr_debug("%s VFSSPI_IOCTL_SET_USER_DATA\n", __func__);
+		pr_info("%s VFSSPI_IOCTL_SET_USER_DATA\n", __func__);
 		if ((void *)arg == NULL) {
 			pr_err("%s VFSSPI_IOCTL_SET_USER_DATA is failed\n",
 				__func__);
@@ -916,7 +940,7 @@ long vfsspi_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	case VFSSPI_IOCTL_GET_USER_DATA:
 		retVal = -EFAULT;
 
-		pr_debug("%s VFSSPI_IOCTL_GET_USER_DATA\n", __func__);
+		pr_info("%s VFSSPI_IOCTL_GET_USER_DATA\n", __func__);
 
 		if (vfsSpiDev->userInfoData.buffer != NULL
 		    && (void *)arg != NULL) {
@@ -952,7 +976,7 @@ long vfsspi_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 #endif
 
 	case VFSSPI_IOCTL_SET_DRDY_INT:
-		pr_debug("%s VFSSPI_IOCTL_SET_DRDY_INT\n", __func__);
+		pr_info("%s VFSSPI_IOCTL_SET_DRDY_INT\n", __func__);
 
 		if (copy_from_user(&drdy_enable_flag,
 			(void *)arg, sizeof(drdy_enable_flag)) != 0) {
@@ -968,7 +992,7 @@ long vfsspi_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 
 #ifndef ENABLE_SENSORS_FPRINT_SECURE
 	case VFSSPI_IOCTL_STREAM_READ_START:
-		pr_debug("VFSSPI_IOCTL_STREAM_READ_START");
+		pr_info("VFSSPI_IOCTL_STREAM_READ_START");
 		if (copy_from_user(&streamDataSize, (void *)arg,
 			sizeof(unsigned int)) != 0) {
 			pr_err("Failed copy from user.\n");
@@ -987,7 +1011,7 @@ long vfsspi_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		break;
 
 	case VFSSPI_IOCTL_STREAM_READ_STOP:
-		pr_debug("VFSSPI_IOCTL_STREAM_READ_STOP");
+		pr_info("VFSSPI_IOCTL_STREAM_READ_STOP");
 		if (vfsSpiDev->streamBuffer != NULL) {
 			kfree(vfsSpiDev->streamBuffer);
 			vfsSpiDev->streamBuffer = NULL;
@@ -1035,6 +1059,8 @@ long vfsspi_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			pr_info("%s ocp flag high\n", __func__);
 		break;
 	case VFSSPI_IOCTL_POWER_OFF:
+		pr_info("[fingerprint/vfsspi_ioctl] boosting for unlock!\n");
+		zzmoove_boost(1, 5, 20, 5, 100, 5, 20, 0);
 		pr_info("%s VFSSPI_IOCTL_POWER_OFF\n", __func__);
 		if (vfsSpiDev->ldocontrol && vfsSpiDev->ldo_onoff) {
 			vfsspi_regulator_onoff(vfsSpiDev, false);
