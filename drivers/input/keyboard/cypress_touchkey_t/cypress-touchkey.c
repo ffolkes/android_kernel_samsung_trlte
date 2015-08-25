@@ -769,7 +769,7 @@ static irqreturn_t cypress_touchkey_interrupt(int irq, void *dev_id)
 	struct timeval time_now_tk_mt;
 	struct timeval time_now_tkf;
 	unsigned int tmp_sttg_tkf_precheck_timeout = 0;
-	bool flg_justwokeup = false;
+	//bool flg_justwokeup = false;
 
 	if (!atomic_read(&info->keypad_enable)) {
 			goto out;
@@ -779,10 +779,10 @@ static irqreturn_t cypress_touchkey_interrupt(int irq, void *dev_id)
 	if (ret) {
 		dev_info(&info->client->dev,
 				"%s: not real interrupt (%d).\n", __func__, ret);
-	if (!flg_power_suspended)
-		goto out;
-	else
-			flg_justwokeup = true;
+		//if (!flg_power_suspended)
+			goto out;
+		//else
+		//	flg_justwokeup = true;
 	}
 
 	if (info->is_powering_on) {
@@ -1438,6 +1438,8 @@ static ssize_t cypress_touchkey_led_control(struct device *dev,
 	static const int ledCmd[] = {TK_CMD_LED_OFF, TK_CMD_LED_ON};
 
 	dev_dbg(&info->client->dev, "called %s\n", __func__);
+	
+	pr_info(LOGTAG"/cypress_touchkey_led_control]\n");
 
 	if (wake_lock_active(&info->fw_wakelock)) {
 		dev_err(&info->client->dev, "%s : wackelock active\n",
@@ -2088,6 +2090,7 @@ static ssize_t sec_keypad_enable_store(struct device *dev,
 	unsigned int val = 0;
 	sscanf(buf, "%d", &val);
 	val = (val == 0 ? 0 : 1);
+	pr_info(LOGTAG"/sec_keypad_enable_store] value: %d\n", val);
 	atomic_set(&info->keypad_enable, val);
 	if (val) {
 		for (i = 0; i < ARRAY_SIZE(info->keycode); i++)
@@ -2822,8 +2825,10 @@ static void cypress_input_close(struct input_dev *dev)
 	// if tk slide is enabled, or tk flick is enabled and tkf media mode is on
 	// and media is playing, keep the touchkeys on.
 	if (sttg_tks_mode == 1 || (sttg_tks_mode == 2 && plasma_media_active)
-		|| (sttg_tkf_mode && plasma_media_active && sttg_tkf_mediamode))
+		|| (sttg_tkf_mode && plasma_media_active && sttg_tkf_mediamode)) {
+		pr_info(LOGTAG"/cypress_input_close] aborting because touchkeys requested to stay on\n");
 		return;
+	}
 
 	dev_info(&info->client->dev, "%s\n",__func__);
 
