@@ -437,6 +437,12 @@ static ssize_t store_##file_name					\
 {									\
 	int ret;							\
 	struct cpufreq_policy new_policy;				\
+	int mpd = strcmp(current->comm, "mpdecision");			\
+	\
+	if (mpd == 0) {							\
+		pr_info("[cpufreq/%s] mpdecision scaling modification blocked\n", __func__);	\
+		return ret;						\
+	}	\
 	\
 	ret = cpufreq_get_policy(&new_policy, policy->cpu);		\
 	if (ret)							\
@@ -447,12 +453,12 @@ static ssize_t store_##file_name					\
 	return -EINVAL;						\
 	\
 	if (sttg_scaling_freq_lock && (strstr(__func__, "max_freq") || strstr(__func__, "min_freq"))) {	\
-		/*pr_info("[cpufreq/%s] freq lock on, ignoring attempt to change freq to '%d' from '%d' for cpu %d\n",	\
-		 __func__, new_policy.object, policy->object, policy->cpu);*/	\
+		pr_info("[cpufreq/%s] freq lock on, ignoring attempt to change freq to '%d' from '%d' for cpu %d\n",	\
+		 __func__, new_policy.object, policy->object, policy->cpu);	\
 		return -EINVAL;	\
-	}/* else	\
+	} else	\
 	  pr_info("[cpufreq/%s] freq lock off, allowing freq change to '%d' from '%d' for cpu %d\n",	\
-	  __func__, new_policy.object, policy->object, policy->cpu);*/	\
+	  __func__, new_policy.object, policy->object, policy->cpu);	\
 	\
 	ret = cpufreq_driver->verify(&new_policy);			\
 	if (ret)							\
@@ -970,10 +976,11 @@ err_out_kobj_put:
 	return ret;
 }
 
-static void cpufreq_init_policy(struct cpufreq_policy *policy)
+static void cpufreq_init_policy(struct cpufreq_policy *policy, struct device *dev)
 {
 	struct cpufreq_policy new_policy;
 	int ret = 0;
+	unsigned int cpu = dev->id;
 
 	memcpy(&new_policy, policy, sizeof(*policy));
 	/* assure that the starting sequence is run in cpufreq_set_policy */
@@ -988,6 +995,14 @@ static void cpufreq_init_policy(struct cpufreq_policy *policy)
 		pr_debug("setting policy failed\n");
 		if (cpufreq_driver->exit)
 			cpufreq_driver->exit(policy);
+	}
+	if (per_cpu(cpufreq_policy_save, cpu).min) {
+		policy->min = per_cpu(cpufreq_policy_save, cpu).min;
+		policy->user_policy.min = policy->min;
+	}
+	if (per_cpu(cpufreq_policy_save, cpu).max) {
+		policy->max = per_cpu(cpufreq_policy_save, cpu).max;
+		policy->user_policy.max = policy->max;
 	}
 }
 
@@ -1256,7 +1271,7 @@ static int __cpufreq_add_dev(struct device *dev, struct subsys_interface *sif,
 	list_add(&policy->policy_list, &cpufreq_policy_list);
 	write_unlock_irqrestore(&cpufreq_driver_lock, flags);
 
-	cpufreq_init_policy(policy);
+	cpufreq_init_policy(policy, dev);
 
 	write_lock_irqsave(&cpufreq_driver_lock, flags);
 	for_each_cpu(j, policy->cpus)
@@ -2119,6 +2134,14 @@ static int cpufreq_set_policy(struct cpufreq_policy *policy,
 		ret = -EINVAL;
 		goto error_out;
 	}
+
+	// Added to ensure mpdecision can scale back the policy
+	if (new_policy->user_policy.min > new_policy->min)
+		new_policy->user_policy.min = new_policy->min;
+
+	// ff: added to ensure userspace can reliable set policy->max.
+	if (new_policy->user_policy.max < new_policy->max)
+		new_policy->user_policy.max = new_policy->max;
 
 	/* verify the cpu speed can be set within this limit */
 	ret = cpufreq_driver->verify(new_policy);
