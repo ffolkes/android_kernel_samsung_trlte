@@ -15,6 +15,13 @@
 
 #include "ssp_sensorhub.h"
 
+extern void zzmoove_boost(int screen_state,
+						  int max_cycles, int mid_cycles, int allcores_cycles,
+						  int input_cycles, int devfreq_max_cycles, int devfreq_mid_cycles,
+						  int userspace_cycles);
+
+static int last_orientation = 999;
+
 static void ssp_sensorhub_log(const char *func_name,
 				const char *data, int length)
 {
@@ -22,6 +29,9 @@ static void ssp_sensorhub_log(const char *func_name,
 	char *log_str;
 	int log_size;
 	int i;
+	int orientation;
+
+pr_info("[SSP]: plasma\n");
 
 	if (likely(length <= BIG_DATA_SIZE))
 		log_size = length;
@@ -50,7 +60,25 @@ static void ssp_sensorhub_log(const char *func_name,
 			strlcat(log_str, "..., ", log_size);
 	}
 
-	pr_info("[SSP]: %s - %s (%d)", func_name, log_str, length);
+	if (length == 4 && strstr(func_name, "ssp_sensorhub_list")) {
+		
+		orientation = (signed char)data[3];
+		
+		// treat vertical the same as face-up.
+		if (orientation < 0)
+			orientation = 0;
+		
+		pr_info("[SSP]: orientation: %d (actual: %d), old: %d\n", orientation, (signed char)data[3], last_orientation);
+		
+		if (orientation != last_orientation && ((orientation == 0 && last_orientation != 2) || orientation == 1 || orientation == 3)) {
+			// TODO: compiler tags
+			zzmoove_boost(1, 25, 0, 25, 50, 25, 50, 0);
+		}
+		
+		last_orientation = orientation;
+	}
+
+	pr_info("[SSP]: %s - %s (%d)\n", func_name, log_str, length);
 	kfree(log_str);
 }
 
