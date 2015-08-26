@@ -2427,9 +2427,9 @@ static int slim_rx_mux_put(struct snd_kcontrol *kcontrol,
 
 	widget->value = ucontrol->value.enumerated.item[0];
 
-#ifdef CONFIG_PLASMA
-    plasma_sound_playing(ucontrol->value.integer.value[0]);
-#endif
+//#ifdef CONFIG_PLASMA
+//    plasma_sound_playing(ucontrol->value.integer.value[0]);
+//#endif
 
 	mutex_lock(&codec->mutex);
 
@@ -4860,6 +4860,10 @@ static int tomtom_startup(struct snd_pcm_substream *substream,
 	pr_debug("%s(): substream = %s  stream = %d\n" , __func__,
 		 substream->name, substream->stream);
 
+#ifdef CONFIG_PLASMA
+    plasma_sound_playing(true);
+#endif
+
 	return 0;
 }
 
@@ -4868,6 +4872,10 @@ static void tomtom_shutdown(struct snd_pcm_substream *substream,
 {
 	pr_debug("%s(): substream = %s  stream = %d\n" , __func__,
 		 substream->name, substream->stream);
+
+#ifdef CONFIG_PLASMA
+    plasma_sound_playing(false);
+#endif
 }
 
 
