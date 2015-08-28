@@ -50,6 +50,7 @@
 #define TSENS_NAME_MAX 20
 #define TSENS_NAME_FORMAT "tsens_tz_sensor%d"
 #define THERM_SECURE_BITE_CMD 8
+#define CORE_MAX_FREQ 2880000
 
 static struct msm_thermal_data msm_thermal_info;
 static struct delayed_work check_temp_work;
@@ -101,6 +102,7 @@ static struct kobj_attribute cx_mode_attr;
 static struct kobj_attribute gfx_mode_attr;
 static struct attribute_group cx_attr_gp;
 static struct attribute_group gfx_attr_gp;
+static long *tsens_temp_at_panic;
 
 enum thermal_threshold {
 	HOTPLUG_THRESHOLD_HIGH,
@@ -956,6 +958,23 @@ get_temp_exit:
 	return ret;
 }
 
+static int msm_thermal_panic_callback(struct notifier_block *nfb,
+			unsigned long event, void *data)
+{
+	int i;
+
+	for (i = 0; i < max_tsens_num; i++)
+		therm_get_temp(tsens_id_map[i],
+				THERM_TSENS_ID,
+				&tsens_temp_at_panic[i]);
+
+	return NOTIFY_OK;
+}
+
+static struct notifier_block msm_thermal_panic_notifier = {
+	.notifier_call = msm_thermal_panic_callback,
+};
+
 static int set_threshold(uint32_t zone_id,
 	struct sensor_threshold *threshold)
 {
@@ -1449,7 +1468,7 @@ static void do_freq_control(long temp)
 		limit_idx += msm_thermal_info.bootup_freq_step;
 		if (limit_idx >= limit_idx_high) {
 			limit_idx = limit_idx_high;
-			max_freq = UINT_MAX;
+			max_freq = CORE_MAX_FREQ;
 		} else
 			max_freq = table[limit_idx].frequency;
 	}
@@ -1642,7 +1661,9 @@ init_kthread:
 
 static __ref int do_freq_mitigation(void *data)
 {
+	long temp = 0;
 	int ret = 0;
+	bool skip_mitig = false;
 	uint32_t cpu = 0, max_freq_req = 0, min_freq_req = 0;
 
 	while (!kthread_should_stop()) {
@@ -1651,16 +1672,29 @@ static __ref int do_freq_mitigation(void *data)
 			;
 		INIT_COMPLETION(freq_mitigation_complete);
 
+		ret = therm_get_temp(msm_thermal_info.sensor_id,
+			THERM_TSENS_ID, &temp);
+		if (ret)
+			pr_err("Unable to read TSENS sensor:%d\n",
+				msm_thermal_info.sensor_id);
+		else if (temp <= msm_thermal_info.limit_temp_degC)
+			skip_mitig = true;
+		else 
+			skip_mitig = false;
+
 		get_online_cpus();
 		for_each_possible_cpu(cpu) {
 			max_freq_req = (cpus[cpu].max_freq) ?
 					msm_thermal_info.freq_limit :
-					UINT_MAX;
+					CORE_MAX_FREQ;
 			max_freq_req = min(max_freq_req,
 					cpus[cpu].user_max_freq);
 
 			min_freq_req = max(min_freq_limit,
 					cpus[cpu].user_min_freq);
+
+			if (skip_mitig && CORE_MAX_FREQ > max_freq_req)
+				max_freq_req = CORE_MAX_FREQ;
 
 			if ((max_freq_req == cpus[cpu].limited_max_freq)
 				&& (min_freq_req ==
@@ -1681,6 +1715,7 @@ reset_threshold:
 		}
 		put_online_cpus();
 	}
+
 	return ret;
 }
 
@@ -2290,11 +2325,11 @@ static void __ref disable_msm_thermal(void)
 
 	get_online_cpus();
 	for_each_possible_cpu(cpu) {
-		if (cpus[cpu].limited_max_freq == UINT_MAX &&
+		if (cpus[cpu].limited_max_freq == CORE_MAX_FREQ &&
 			cpus[cpu].limited_min_freq == 0)
 			continue;
 		pr_info("Max frequency reset for CPU%d\n", cpu);
-		cpus[cpu].limited_max_freq = UINT_MAX;
+		cpus[cpu].limited_max_freq = CORE_MAX_FREQ;
 		cpus[cpu].limited_min_freq = 0;
 		update_cpu_freq(cpu);
 	}
@@ -2523,16 +2558,48 @@ done_cc_nodes:
 	return ret;
 }
 
-int msm_thermal_pre_init(void)
+static void msm_thermal_panic_notifier_init(struct device *dev)
+{
+	int i;
+
+	tsens_temp_at_panic = devm_kzalloc(dev,
+				sizeof(long) * max_tsens_num,
+				GFP_KERNEL);
+	if (!tsens_temp_at_panic) {
+		pr_err("kzalloc failed\n");
+		return;
+	}
+
+	for (i = 0; i < max_tsens_num; i++)
+		tsens_temp_at_panic[i] = LONG_MIN;
+
+	atomic_notifier_chain_register(&panic_notifier_list,
+		&msm_thermal_panic_notifier);
+}
+
+int msm_thermal_pre_init(struct device *dev)
 {
 	int ret = 0;
 
-	tsens_get_max_sensor_num(&max_tsens_num);
+	if (tsens_is_ready() <= 0) {
+		pr_err("Tsens driver is not ready yet\n");
+		return -EPROBE_DEFER;
+	}
+
+	ret = tsens_get_max_sensor_num(&max_tsens_num);
+	if (ret < 0) {
+		pr_err("failed to get max sensor number, err:%d\n", ret);
+		return ret;
+	}
+
 	if (create_sensor_id_map()) {
 		pr_err("Creating sensor id map failed\n");
 		ret = -EINVAL;
 		goto pre_init_exit;
 	}
+
+	if (!tsens_temp_at_panic)
+		msm_thermal_panic_notifier_init(dev);
 
 	if (!thresh) {
 		thresh = kzalloc(
@@ -2639,9 +2706,9 @@ int msm_thermal_init(struct msm_thermal_data *pdata)
 		cpus[cpu].user_offline = 0;
 		cpus[cpu].hotplug_thresh_clear = false;
 		cpus[cpu].max_freq = false;
-		cpus[cpu].user_max_freq = UINT_MAX;
+		cpus[cpu].user_max_freq = CORE_MAX_FREQ;
 		cpus[cpu].user_min_freq = 0;
-		cpus[cpu].limited_max_freq = UINT_MAX;
+		cpus[cpu].limited_max_freq = CORE_MAX_FREQ;
 		cpus[cpu].limited_min_freq = 0;
 		cpus[cpu].freq_thresh_clear = false;
 	}
@@ -2664,7 +2731,7 @@ int msm_thermal_init(struct msm_thermal_data *pdata)
 	INIT_DELAYED_WORK(&check_temp_work, check_temp);
 	schedule_delayed_work(&check_temp_work, 0);
 
-	if (num_possible_cpus() > 1)
+	if (core_control_enabled)
 		register_cpu_notifier(&msm_thermal_cpu_notifier);
 
 	/* emulate default behavior */
@@ -3096,7 +3163,7 @@ static int probe_cc(struct device_node *node, struct msm_thermal_data *data,
 	uint32_t cpu = 0;
 
 	if (num_possible_cpus() > 1) {
-		core_control_enabled = 1;
+//		core_control_enabled = 1;
 		hotplug_enabled = 1;
 	}
 
@@ -3378,7 +3445,7 @@ static int msm_thermal_dev_probe(struct platform_device *pdev)
 	struct msm_thermal_data data;
 
 	memset(&data, 0, sizeof(struct msm_thermal_data));
-	ret = msm_thermal_pre_init();
+	ret = msm_thermal_pre_init(&pdev->dev);
 	if (ret) {
 		pr_err("thermal pre init failed. err:%d\n", ret);
 		goto fail;
@@ -3490,6 +3557,7 @@ int __init msm_thermal_device_init(void)
 {
 	return platform_driver_register(&msm_thermal_device_driver);
 }
+arch_initcall(msm_thermal_device_init);
 
 int __init msm_thermal_late_init(void)
 {
