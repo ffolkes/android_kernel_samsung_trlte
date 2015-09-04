@@ -95,7 +95,8 @@ static unsigned int time_since_tk_mt_lastpress = 0;
 // tk flick.
 extern bool sttg_tkf_mode;
 extern bool sttg_tkf_mediamode;
-extern unsigned int sttg_tkf_precheck_timeout;
+extern unsigned int sttg_tkf_key1_precheck_timeout;
+extern unsigned int sttg_tkf_key2_precheck_timeout;
 extern unsigned int sttg_tkf_key1_key_code;
 extern unsigned int sttg_tkf_key2_key_code;
 extern bool flg_tkf_tsp;
@@ -902,15 +903,21 @@ static irqreturn_t cypress_touchkey_interrupt(int irq, void *dev_id)
 		// hold a wakelock, and automatically unwakelock it in 1000ms.
 		tk_refreshwakelock(1000);
 		
-		if (!flg_power_suspended)
-			tmp_sttg_tkf_precheck_timeout = sttg_tkf_precheck_timeout;
-		else {
+		if (!flg_power_suspended) {
+			if (code == 0)
+				tmp_sttg_tkf_precheck_timeout = sttg_tkf_key1_precheck_timeout;
+			else
+				tmp_sttg_tkf_precheck_timeout = sttg_tkf_key2_precheck_timeout;
+		} else {
 			// if we're suspended, we want to give extra, extra time to account for unfreezing.
 			
 			//if (flg_justwokeup)
 			//	tmp_sttg_tkf_precheck_timeout = 1000;
 			//else
-				tmp_sttg_tkf_precheck_timeout = 400;
+				if (code == 0)
+					tmp_sttg_tkf_precheck_timeout = max(400, (int) sttg_tkf_key1_precheck_timeout);
+				else
+					tmp_sttg_tkf_precheck_timeout = max(400, (int) sttg_tkf_key2_precheck_timeout);
 		}
 		
 		if (press) {
