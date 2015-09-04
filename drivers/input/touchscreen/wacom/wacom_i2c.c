@@ -44,6 +44,8 @@ extern unsigned int sttg_epen_out_screenoff_key_code;
 extern bool sttg_epen_out_screenoff_key_delay;
 extern bool sttg_epen_out_screenoff_powerfirst;
 
+extern unsigned int sttg_epen_in_key_code;
+extern bool sttg_epen_in_key_delay;
 extern bool sttg_epen_in_powerfirst;
 extern bool sttg_epen_out_vibrate;
 
@@ -908,7 +910,7 @@ static void pen_insert_work(struct work_struct *work)
 			flg_epen_tsp_block = true;
 		
 		if (sttg_epen_out_vibrate)
-			controlVibrator(100, 100);
+			controlVibrator(125, 125);
 		
 		if (flg_power_suspended) {
 			// screen is off.
@@ -956,6 +958,16 @@ static void pen_insert_work(struct work_struct *work)
 		// pen inserted.
 		
 		flg_epen_tsp_block = false;
+		
+		if (sttg_epen_in_key_code) {
+			
+			pr_info("[E-PEN] SCREEN-ON TRIGGERED --[E-PEN INSERTED]--\n");
+			vk_press_button(sttg_epen_in_key_code,
+							sttg_epen_in_key_delay,
+							true,
+							false,
+							false);
+		}
 		
 		if (!flg_power_suspended && sttg_epen_in_powerfirst && flg_epen_turnedon) {
 			// if the screen is on and the user wants to turn it off when inserted.
