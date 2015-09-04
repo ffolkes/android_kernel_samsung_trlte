@@ -96,6 +96,7 @@ extern int plasma_inject_tsp_y;
 extern bool flg_voice_allowturnoff;
 extern int s2w_switch;
 extern unsigned int ctr_power_suspends;
+struct input_dev *plasma_input_dev_tsp;
 
 extern int boot_mode_recovery;
 #ifdef CONFIG_SAMSUNG_LPM_MODE
@@ -2556,6 +2557,8 @@ static int fts_probe(struct i2c_client *client, const struct i2c_device_id *idp)
 	fts_secure_touch_init(info);
 #endif
 
+	plasma_input_dev_tsp = info->input_dev;
+
 	device_init_wakeup(&client->dev, 1);
 
 	dev_err(&info->client->dev, "%s done\n", __func__);
@@ -2958,6 +2961,18 @@ void fts_release_all_finger(struct fts_ts_info *info)
 		info->tsp_booster->dvfs_set(info->tsp_booster, -1);
 #endif
 }
+
+void plasma_tsp_suspend(void)
+{
+	fts_input_close(plasma_input_dev_tsp);
+}
+EXPORT_SYMBOL(plasma_tsp_suspend);
+	
+void plasma_tsp_resume(void)
+{
+	fts_input_open(plasma_input_dev_tsp);
+}
+EXPORT_SYMBOL(plasma_tsp_resume);
 
 #if defined(CONFIG_SECURE_TOUCH)
 static void fts_secure_touch_stop(struct fts_ts_info *info, int blocking)
