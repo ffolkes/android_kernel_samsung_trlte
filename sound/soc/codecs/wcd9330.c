@@ -4861,7 +4861,8 @@ static int tomtom_startup(struct snd_pcm_substream *substream,
 		 substream->name, substream->stream);
 
 #ifdef CONFIG_PLASMA
-    plasma_sound_playing(true);
+	if (!substream->stream)  // only fire on stream 0
+		plasma_sound_playing(true);
 #endif
 
 	return 0;
@@ -4874,7 +4875,8 @@ static void tomtom_shutdown(struct snd_pcm_substream *substream,
 		 substream->name, substream->stream);
 
 #ifdef CONFIG_PLASMA
-    plasma_sound_playing(false);
+	if (!substream->stream)  // only fire on stream 0
+		plasma_sound_playing(false);
 #endif
 }
 
