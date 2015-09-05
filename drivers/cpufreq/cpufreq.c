@@ -1231,8 +1231,8 @@ static int __cpufreq_add_dev(struct device *dev, struct subsys_interface *sif,
 	 */
 	cpumask_and(policy->cpus, policy->cpus, cpu_online_mask);
 
-	if (policy->max > 2649600)
-		policy->max = 2649600;
+	if (policy->max >= 2649600)
+		policy->max = 2265600;
 
 	policy->user_policy.min = policy->min;
 	policy->user_policy.max = policy->max;
@@ -1852,6 +1852,9 @@ int __cpufreq_driver_target(struct cpufreq_policy *policy,
 
 	if (cpufreq_disabled())
 		return -ENODEV;
+	
+	if (!target_freq)
+		return 0;
 
 	/* Make sure that target_freq is within supported range */
 	if (target_freq > policy->max)
