@@ -381,7 +381,13 @@ KBUILD_CPPFLAGS := -D__KERNEL__
 
 KBUILD_CFLAGS   := -Wall -Wundef -Wstrict-prototypes -Wno-trigraphs \
 		   -fno-strict-aliasing -fno-common \
-		   -fno-delete-null-pointer-checks
+		   -fno-delete-null-pointer-checks \
+		   -Werror-implicit-function-declaration \
+		   -Wno-format-security -mtune=cortex-a15 \
+		   -fmodulo-sched -fmodulo-sched-allow-regmoves -fno-tree-vectorize \
+		   -funswitch-loops -fpredictive-commoning -fgcse-after-reload \
+		   -fno-aggressive-loop-optimizations \
+		   --param l1-cache-size=32 --param l1-cache-line-size=64 --param l2-cache-size=2048
 KBUILD_AFLAGS_KERNEL :=
 KBUILD_CFLAGS_KERNEL :=
 KBUILD_AFLAGS   := -D__ASSEMBLY__
@@ -581,7 +587,7 @@ all: vmlinux
 ifdef CONFIG_CC_OPTIMIZE_FOR_SIZE
 KBUILD_CFLAGS	+= -Os $(call cc-disable-warning,maybe-uninitialized,)
 else
-KBUILD_CFLAGS	+= -O3
+KBUILD_CFLAGS	+= -O2 $(call cc-disable-warning,maybe-uninitialized,)
 endif
 
 include $(srctree)/arch/$(SRCARCH)/Makefile
