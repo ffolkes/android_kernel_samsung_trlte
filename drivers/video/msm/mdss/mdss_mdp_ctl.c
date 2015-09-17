@@ -29,6 +29,8 @@
 
 #undef MDSS_BW_DEBUG
 
+extern bool flg_kcal_needs_write;
+
 static void mdss_mdp_xlog_mixer_reg(struct mdss_mdp_ctl *ctl);
 static inline u64 fudge_factor(u64 val, u32 numer, u32 denom)
 {
@@ -3029,8 +3031,12 @@ int mdss_mdp_display_commit(struct mdss_mdp_ctl *ctl, void *arg,
 		return -ENODEV;
 	}
 
-	mutex_lock(&ctl->lock);
+	// use a trylock to reduce tearing when kcal is injecting commits.
+	// don't bother indenting, as that will make git think this whole section changed.
+	if (mutex_trylock(&ctl->lock)) {
 	pr_debug("commit ctl=%d play_cnt=%d\n", ctl->num, ctl->play_cnt);
+
+	flg_kcal_needs_write = false;
 
 	if (!mdss_mdp_ctl_is_power_on(ctl)) {
 		mutex_unlock(&ctl->lock);
@@ -3179,19 +3185,20 @@ int mdss_mdp_display_commit(struct mdss_mdp_ctl *ctl, void *arg,
 	ctl->flush_bits = 0;
 #if defined(CONFIG_FB_MSM_MDSS_SAMSUNG)
 	if (mdp5_data) {
-		mutex_lock(&mdp5_data->list_lock);
-		if (csc_change == 1) {
-			struct mdss_mdp_pipe *pipe, *next;
-			list_for_each_entry_safe(pipe, next, &mdp5_data->pipes_used, list) {
-				if (pipe->type == MDSS_MDP_PIPE_TYPE_VIG) {
-					pr_info(" mdss_mdp_csc_setup start\n");
-					mdss_mdp_csc_setup(MDSS_MDP_BLOCK_SSPP, pipe->num,1,
-									MDSS_MDP_CSC_YUV2RGB);
-					csc_change = 0;
+		if (mutex_trylock(&mdp5_data->list_lock)) {
+			if (csc_change == 1) {
+				struct mdss_mdp_pipe *pipe, *next;
+				list_for_each_entry_safe(pipe, next, &mdp5_data->pipes_used, list) {
+					if (pipe->type == MDSS_MDP_PIPE_TYPE_VIG) {
+						pr_info(" mdss_mdp_csc_setup start\n");
+						mdss_mdp_csc_setup(MDSS_MDP_BLOCK_SSPP, pipe->num,1,
+										MDSS_MDP_CSC_YUV2RGB);
+						csc_change = 0;
+					}
 				}
 			}
+			mutex_unlock(&mdp5_data->list_lock);
 		}
-		mutex_unlock(&mdp5_data->list_lock);
 	}
 #endif
 
@@ -3222,6 +3229,8 @@ done:
 	mdss_mdp_clk_ctrl(MDP_BLOCK_POWER_OFF, false);
 
 	mutex_unlock(&ctl->lock);
+	} else
+		pr_info("[mdss_mdp_display_commit] skipping, commit already in progress\n");
 
 	return ret;
 }
