@@ -66,6 +66,7 @@ static struct completion freq_mitigation_complete;
 static struct completion thermal_monitor_complete;
 
 uint32_t limited_max_freq_thermal = -1;
+static uint32_t plasma_core_alt_limit_temp_degC = 0;
 
 static int enabled;
 static int polling_enabled;
@@ -263,6 +264,19 @@ enum PMIC_SW_MODE {
 /* last 3 minutes based on 250ms polling cycle */
 #define MAX_HISTORY_SZ         ((3*60*1000) / DEFAULT_POLLING_MS)
 
+unsigned int msmthermal_get_plasma_core_limittemp(void)
+{
+	return msm_thermal_info.plasma_core_limit_temp_degC;
+}
+EXPORT_SYMBOL(msmthermal_get_plasma_core_limittemp);
+
+void msmthermal_set_plasma_core_alt_limittemp(int temp)
+{
+	if (temp < 120)   // sanity check
+		plasma_core_alt_limit_temp_degC = temp;
+}
+EXPORT_SYMBOL(msmthermal_set_plasma_core_alt_limittemp);
+
 struct msm_thermal_stat_data {
 	int32_t temp_history[MAX_HISTORY_SZ];
 	uint32_t throttled;
@@ -281,6 +295,8 @@ module_param_named(core_limit_temp_degC, msm_thermal_info.core_limit_temp_degC,
 			int, 0664);
 module_param_named(core_control_mask, msm_thermal_info.core_control_mask,
 			uint, 0664);
+module_param_named(plasma_core_limit_temp_degC, msm_thermal_info.plasma_core_limit_temp_degC,
+			int, 0664);
 
 static int  msm_thermal_cpufreq_callback(struct notifier_block *nfb,
 		unsigned long event, void *data)
@@ -1077,29 +1093,38 @@ static void __ref do_core_control(long temp)
 {
 	int i = 0;
 	int ret = 0;
+	int core_limit_temp;
 
 	if (!core_control_enabled)
 		return;
+	
+	if (msm_thermal_info.plasma_core_limit_temp_degC) {
+		if (plasma_core_alt_limit_temp_degC)
+			core_limit_temp = plasma_core_alt_limit_temp_degC;
+		else
+			core_limit_temp = msm_thermal_info.plasma_core_limit_temp_degC;
+	} else
+		core_limit_temp = msm_thermal_info.core_limit_temp_degC;
 
 	mutex_lock(&core_control_mutex);
 	if (msm_thermal_info.core_control_mask &&
-		temp >= msm_thermal_info.core_limit_temp_degC) {
+		temp >= core_limit_temp) {
 		for (i = num_possible_cpus(); i > 0; i--) {
 			if (!(msm_thermal_info.core_control_mask & BIT(i)))
 				continue;
 			if (cpus_offlined & BIT(i) && !cpu_online(i))
 				continue;
+			cpus_offlined |= BIT(i);
 			pr_info("Set Offline: CPU%d Temp: %ld\n",
 					i, temp);
 			ret = cpu_down(i);
 			if (ret)
 				pr_err("Error %d offline core %d\n",
 					ret, i);
-			cpus_offlined |= BIT(i);
 			break;
 		}
 	} else if (msm_thermal_info.core_control_mask && cpus_offlined &&
-		temp <= (msm_thermal_info.core_limit_temp_degC -
+		temp <= (core_limit_temp -
 			msm_thermal_info.core_temp_hysteresis_degC)) {
 		for (i = 0; i < num_possible_cpus(); i++) {
 			if (!(cpus_offlined & BIT(i)))
@@ -1107,6 +1132,10 @@ static void __ref do_core_control(long temp)
 			cpus_offlined &= ~BIT(i);
 			pr_info("Allow Online CPU%d Temp: %ld\n",
 					i, temp);
+			
+			// ff: if a core was taken offline, don't force it back on.
+			break;
+			
 			/*
 			 * If this core is already online, then bring up the
 			 * next offlined core.
@@ -1487,7 +1516,11 @@ static void check_temp(struct work_struct *work)
 				msm_thermal_info.sensor_id, ret);
 		goto reschedule;
 	}
-	do_core_control(temp);
+	
+	// only do core control if the mask isn't empty.
+	if (msm_thermal_info.bootup_freq_control_mask)
+		do_core_control(temp);
+	
 	do_psm();
 	do_gfx_phase_cond();
 	do_cx_phase_cond();
@@ -1501,7 +1534,10 @@ static void check_temp(struct work_struct *work)
 	}
 
 	do_vdd_restriction();
-	do_freq_control(temp);
+	
+	// only do freq control if the mask isn't empty.
+	if (msm_thermal_info.bootup_freq_control_mask)
+		do_freq_control(temp);
 
 	//pr_info("%s: worker is alive!\n", KBUILD_MODNAME);
 reschedule:
@@ -1666,6 +1702,9 @@ static __ref int do_freq_mitigation(void *data)
 
 			min_freq_req = max(min_freq_limit,
 					cpus[cpu].user_min_freq);
+			
+			if (cpus[cpu].limited_max_freq > 2649600)
+				cpus[cpu].limited_max_freq = 2649600;
 
 			if ((max_freq_req == cpus[cpu].limited_max_freq)
 				&& (min_freq_req ==
@@ -3334,7 +3373,7 @@ static int probe_therm_reset(struct device_node *node,
 		goto PROBE_RESET_EXIT;
 	}
 
-	therm_reset_enabled = true;
+	therm_reset_enabled = false;
 
 PROBE_RESET_EXIT:
 	if (ret) {
