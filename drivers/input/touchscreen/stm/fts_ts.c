@@ -115,7 +115,12 @@ extern int boot_mode_recovery;
 extern int poweroff_charging;
 #endif
 
+// prototypes.
+static int fts_command(struct fts_ts_info *info, unsigned char cmd);
+static void fts_enable_feature(struct fts_ts_info *info, unsigned char cmd, int enable);
+
 static bool flg_enable_hover = false;
+static bool flg_enable_glove = false;
 //bool flg_tsp_always_on = false;  // depreciated
 
 #ifdef USE_OPEN_CLOSE
@@ -153,10 +158,19 @@ static ssize_t enable_hover_store(struct device *dev,
 static ssize_t enable_hover_show(struct device *dev,
 								 struct device_attribute *attr, char *buf);
 
+static ssize_t enable_glove_store(struct device *dev,
+								  struct device_attribute *attr, const char *buf, size_t size);
+
+static ssize_t enable_glove_show(struct device *dev,
+								 struct device_attribute *attr, char *buf);
+
 static struct device_attribute tsp_attrs[] = {
 	__ATTR(enable_hover, (S_IRUGO | S_IWUSR | S_IWGRP),
 		   enable_hover_show,
 		   enable_hover_store),
+	__ATTR(enable_glove, (S_IRUGO | S_IWUSR | S_IWGRP),
+		   enable_glove_show,
+		   enable_glove_store),
 };
 
 #if defined(CONFIG_SECURE_TOUCH)
@@ -317,6 +331,52 @@ static ssize_t enable_hover_store(struct device *dev,
 		info->hover_enabled = data;
 		
 		pr_info("[tsp] STORE - flg_enable_hover has been set to: %d\n", data);
+	}
+	
+	return size;
+}
+
+static ssize_t enable_glove_show(struct device *dev,
+								 struct device_attribute *attr, char *buf)
+{
+	return sprintf(buf, "%d\n", flg_enable_glove);
+}
+
+static ssize_t enable_glove_store(struct device *dev,
+								  struct device_attribute *attr, const char *buf, size_t size)
+{
+	struct fts_ts_info *info = dev_get_drvdata(dev);
+	unsigned int ret;
+	unsigned int data;
+	
+	ret = sscanf(buf, "%u\n", &data);
+	
+	if(ret && data >= 0) {
+		
+		if (!data) {
+			// turn glove mode off.
+			
+			fts_command(info, FTS_CMD_MSHOVER_OFF);
+			flg_enable_glove = false;
+			
+		} else if (data == 1) {
+			// turn glove mode on.
+			
+			fts_command(info, FTS_CMD_MSHOVER_ON);
+			flg_enable_glove = true;
+			
+		} else if (data > 1) {
+			// toggle glove mode.
+			
+			if (flg_enable_glove)
+				fts_command(info, FTS_CMD_MSHOVER_OFF);
+			else
+				fts_command(info, FTS_CMD_MSHOVER_ON);
+			
+			flg_enable_glove = !flg_enable_glove;
+		}
+		
+		pr_info("[tsp] STORE - glove mode has been set to: %d\n", flg_enable_glove);
 	}
 	
 	return size;
@@ -2924,6 +2984,11 @@ static int fts_input_open(struct input_dev *dev)
 		info->hover_enabled = true;
 		fts_command(info, FLUSHBUFFER);
 	}
+	
+	// glove mode gets turned off by default, so it must be enabled
+	// every time the screen turns on.
+	if (flg_enable_glove)
+		fts_command(info, FTS_CMD_MSHOVER_ON);
 
 	info->fts_change_scan_rate(info, FTS_CMD_FAST_SCAN);
 
