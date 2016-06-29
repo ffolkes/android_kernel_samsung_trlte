@@ -88,16 +88,27 @@ struct fts_touchkey fts_touchkeys[] = {
 extern int get_lcd_attached(char*);
 
 extern void plasma_process_tsp_touch_enter(int finger, int touchcount);
-extern int plasma_process_tsp_touch_move(int finger, int x, int y, int pressure);
+extern int plasma_process_tsp_touch_move(int finger, int touchcount, int x, int y, int w, int h);
 extern void plasma_process_tsp_touch_exit(int finger, int touchcount, int x, int y, int pressure);
 extern bool plasma_tsp_check_to_stay_on(void);
+extern bool flg_power_softsuspended;
 extern int plasma_inject_tsp_x;
 extern int plasma_inject_tsp_y;
+extern int plasma_inject_tsp_finger;
 extern bool plasma_inject_tsp_upfirst;
+extern int plasma_ary_inject_tsp_x[200];
+extern int plasma_ary_inject_tsp_y[200];
 extern bool flg_voice_allowturnoff;
+//extern bool flg_epen_writing;
+//extern bool flg_epen_hovering;
 extern int s2w_switch;
 extern unsigned int ctr_power_suspends;
-struct input_dev *plasma_input_dev_tsp;
+extern int plasma_tsp_touchcount;
+struct input_dev *plasma_input_dev_tsp = NULL;
+struct fts_ts_info *plasma_fts_ts_info;
+//void tsp_releaseall(void);
+//extern int flg_ctr_inputbooster_typingbooster;
+static int plasma_finger_earlyup[FINGER_MAX];
 
 extern int boot_mode_recovery;
 #ifdef CONFIG_SAMSUNG_LPM_MODE
@@ -1071,6 +1082,8 @@ static unsigned char fts_event_handler_type_b(struct fts_ts_info *info,
 	int bw = 0, bh = 0, palm = 0, sumsize = 0;
 	unsigned short string_addr;
 	unsigned char string_data[10] = {0, };
+	int i;
+	int inject_ary_len;
 #ifdef FTS_SUPPORT_2NDSCREEN_FLAG
 	u8 currentSideFlag = 0;
 #endif
@@ -1306,6 +1319,7 @@ static unsigned char fts_event_handler_type_b(struct fts_ts_info *info,
 			// reset the voice flag since someone is using it.
 			flg_voice_allowturnoff = false;
 			info->touch_count++;
+			plasma_finger_earlyup[TouchID] = false;
 				
 			plasma_process_tsp_touch_enter(TouchID, info->touch_count);
 				
@@ -1325,6 +1339,21 @@ static unsigned char fts_event_handler_type_b(struct fts_ts_info *info,
 				fts_release_all_finger(info);
 				break;
 			}
+				
+			if (plasma_finger_earlyup[TouchID]) {
+				pr_info("[tsp/move] finger %d is being ignored\n", TouchID);
+				return LastLeftEvent;
+			}
+			
+			// maybe for future use.
+			/*if (flg_epen_hovering || flg_epen_writing) {
+				pr_info("[tsp] touch after epen hovering/writing\n");
+				input_mt_slot(info->input_dev, 0);
+				input_mt_report_slot_state(info->input_dev, MT_TOOL_FINGER, 0);
+				input_report_key(info->input_dev, BTN_TOUCH, 0);
+				input_report_key(info->input_dev, BTN_TOOL_FINGER, 0);
+				break;
+			}*/
 
 			if ((EventID == EVENTID_MOTION_POINTER) &&
 				(info->finger[TouchID].state == EVENTID_LEAVE_POINTER)) {
@@ -1351,38 +1380,82 @@ static unsigned char fts_event_handler_type_b(struct fts_ts_info *info,
 #else
 			z = data[7 + EventNum * FTS_EVENT_SIZE];
 #endif
-			//pr_info("[tsp] eid: %d, finger: %d, x: %d, y: %d, bw: %d, bh: %d, sum: %d, palm: %d, z: %d\n",
+			//pr_info("[tsp/move] eid: %d, finger: %d, x: %d, y: %d, bw: %d, bh: %d, sum: %d, palm: %d, z: %d\n",
 			//		EventID, TouchID, x, y, bw, bh, sumsize, palm, z);
 				
-			if (!plasma_process_tsp_touch_move(TouchID, x, y, max(bw, bh)))
+			if (!plasma_process_tsp_touch_move(TouchID, info->touch_count, x, y, bw, bh))
 				break;
+				
+			/*if (flg_ctr_inputbooster_typingbooster > 10) {
+				if (x < 300)
+					x = x - 12;
+				else if (x > 1140)
+					x = x + 12;
+			}*/
 
 			// todo: make this into a function.
-			if (plasma_inject_tsp_x > 0) {
+			if (plasma_inject_tsp_finger == TouchID) {
 				
-				input_mt_slot(info->input_dev, TouchID);
-				input_mt_report_slot_state(info->input_dev, MT_TOOL_FINGER, 1 + (palm << 1));
-				input_report_key(info->input_dev, BTN_TOUCH, 1);
-				input_report_key(info->input_dev, BTN_TOOL_FINGER, 1);
-				input_report_abs(info->input_dev, ABS_MT_POSITION_X, plasma_inject_tsp_x);
-				input_report_abs(info->input_dev, ABS_MT_POSITION_Y, plasma_inject_tsp_y);
-				input_report_abs(info->input_dev, ABS_MT_TOUCH_MAJOR, max(bw, bh));
-				input_report_abs(info->input_dev, ABS_MT_TOUCH_MINOR, min(bw, bh));
-				//input_report_abs(info->input_dev, ABS_MT_SUMSIZE, sumsize);
-				input_report_abs(info->input_dev, ABS_MT_PALM, palm);
-				info->finger[TouchID].lx = plasma_inject_tsp_x;
-				info->finger[TouchID].ly = plasma_inject_tsp_y;
-				
-				input_sync(info->input_dev);
-				
-				pr_info("[tsp/move] INJECTED - eid: %d, finger: %d, x: %d, y: %d, bw: %d, bh: %d, sum: %d, palm: %d, z: %d\n",
-						EventID, TouchID, plasma_inject_tsp_x, plasma_inject_tsp_y, bw, bh, sumsize, palm, z);
-				
-				// reset, because we only want to inject once.
-				plasma_inject_tsp_x = -1;
-				
-				pr_info("[tsp/move] CURRENT - eid: %d, finger: %d, x: %d, y: %d, bw: %d, bh: %d, sum: %d, palm: %d, z: %d\n",
-						EventID, TouchID, x, y, bw, bh, sumsize, palm, z);
+				if (plasma_inject_tsp_x > 0) {
+					
+					input_mt_slot(info->input_dev, TouchID);
+					input_mt_report_slot_state(info->input_dev, MT_TOOL_FINGER, 1 + (palm << 1));
+					input_report_key(info->input_dev, BTN_TOUCH, 1);
+					input_report_key(info->input_dev, BTN_TOOL_FINGER, 1);
+					input_report_abs(info->input_dev, ABS_MT_POSITION_X, plasma_inject_tsp_x);
+					input_report_abs(info->input_dev, ABS_MT_POSITION_Y, plasma_inject_tsp_y);
+					input_report_abs(info->input_dev, ABS_MT_TOUCH_MAJOR, max(bw, bh));
+					input_report_abs(info->input_dev, ABS_MT_TOUCH_MINOR, min(bw, bh));
+					//input_report_abs(info->input_dev, ABS_MT_SUMSIZE, sumsize);
+					input_report_abs(info->input_dev, ABS_MT_PALM, palm);
+					//info->finger[TouchID].lx = plasma_inject_tsp_x;
+					//info->finger[TouchID].ly = plasma_inject_tsp_y;
+					
+					input_sync(info->input_dev);
+					
+					pr_info("[tsp/move] INJECTED - eid: %d, finger: %d, x: %d, y: %d, bw: %d, bh: %d, sum: %d, palm: %d, z: %d\n",
+							EventID, TouchID, plasma_inject_tsp_x, plasma_inject_tsp_y, bw, bh, sumsize, palm, z);
+					
+					// reset, because we only want to inject once.
+					plasma_inject_tsp_x = -1;
+					plasma_inject_tsp_finger = -1;
+					
+					pr_info("[tsp/move] CURRENT - eid: %d, finger: %d, x: %d, y: %d, bw: %d, bh: %d, sum: %d, palm: %d, z: %d\n",
+							EventID, TouchID, x, y, bw, bh, sumsize, palm, z);
+					
+				} else if (plasma_ary_inject_tsp_x[0] > 0) {
+					
+					inject_ary_len = (sizeof(plasma_ary_inject_tsp_x) / sizeof(plasma_ary_inject_tsp_x[0]));
+					
+					for (i = 0; i < inject_ary_len; i++) {
+						
+						if (plasma_ary_inject_tsp_x[i] > 0) {
+							input_mt_slot(info->input_dev, TouchID);
+							input_mt_report_slot_state(info->input_dev, MT_TOOL_FINGER, 1 + (palm << 1));
+							input_report_key(info->input_dev, BTN_TOUCH, 1);
+							input_report_key(info->input_dev, BTN_TOOL_FINGER, 1);
+							input_report_abs(info->input_dev, ABS_MT_POSITION_X, plasma_ary_inject_tsp_x[i]);
+							input_report_abs(info->input_dev, ABS_MT_POSITION_Y, plasma_ary_inject_tsp_y[i]);
+							input_report_abs(info->input_dev, ABS_MT_TOUCH_MAJOR, max(bw, bh));
+							input_report_abs(info->input_dev, ABS_MT_TOUCH_MINOR, min(bw, bh));
+							
+							input_sync(info->input_dev);
+							
+							pr_info("[tsp/move] INJECTED - ctr: %d, eid: %d, finger: %d, x: %d, y: %d, bw: %d, bh: %d, sum: %d, palm: %d, z: %d\n",
+									i, EventID, TouchID, plasma_ary_inject_tsp_x[i], plasma_ary_inject_tsp_y[i], bw, bh, sumsize, palm, z);
+						} else {
+							break;
+						}
+					}
+					
+					// reset, because we only want to inject once.
+					memset(plasma_ary_inject_tsp_x, -1, sizeof(plasma_ary_inject_tsp_x));
+					memset(plasma_ary_inject_tsp_y, -1, sizeof(plasma_ary_inject_tsp_y));
+					plasma_inject_tsp_finger = -1;
+					
+					pr_info("[tsp/move] CURRENT - eid: %d, finger: %d, x: %d, y: %d, bw: %d, bh: %d, sum: %d, palm: %d, z: %d\n",
+							EventID, TouchID, x, y, bw, bh, sumsize, palm, z);
+				}
 			}
 
 			input_mt_slot(info->input_dev, TouchID);
@@ -1438,42 +1511,76 @@ static unsigned char fts_event_handler_type_b(struct fts_ts_info *info,
 			plasma_process_tsp_touch_exit(TouchID, info->touch_count, x, y, max(bw, bh));
 				
 			// todo: make this into a function.
-			if (plasma_inject_tsp_x > 0) {
+			if (plasma_inject_tsp_finger == TouchID) {
 				
-				if (plasma_inject_tsp_upfirst) {
+				if (plasma_inject_tsp_x > 0) {
 					
-					pr_info("[tsp/exit] INJECTING - lifting finger first\n");
-					
-					input_mt_slot(info->input_dev, 0);
-					input_mt_report_slot_state(info->input_dev, MT_TOOL_FINGER, 0);
-					input_report_key(info->input_dev, BTN_TOUCH, 0);
-					input_report_key(info->input_dev, BTN_TOOL_FINGER, 0);
+					if (plasma_inject_tsp_upfirst) {
+						
+						pr_info("[tsp/exit] INJECTING - lifting finger first\n");
+						
+						input_mt_slot(info->input_dev, 0);
+						input_mt_report_slot_state(info->input_dev, MT_TOOL_FINGER, 0);
+						input_report_key(info->input_dev, BTN_TOUCH, 0);
+						input_report_key(info->input_dev, BTN_TOOL_FINGER, 0);
+						
+						input_sync(info->input_dev);
+						
+						plasma_inject_tsp_upfirst = false;
+					}
+
+					input_mt_slot(info->input_dev, TouchID);
+					input_mt_report_slot_state(info->input_dev, MT_TOOL_FINGER, 1 + (palm << 1));
+					input_report_key(info->input_dev, BTN_TOUCH, 1);
+					input_report_key(info->input_dev, BTN_TOOL_FINGER, 1);
+					input_report_abs(info->input_dev, ABS_MT_POSITION_X, plasma_inject_tsp_x);
+					input_report_abs(info->input_dev, ABS_MT_POSITION_Y, plasma_inject_tsp_y);
+					input_report_abs(info->input_dev, ABS_MT_TOUCH_MAJOR, max(bw, bh));
+					input_report_abs(info->input_dev, ABS_MT_TOUCH_MINOR, min(bw, bh));
+					//input_report_abs(info->input_dev, ABS_MT_SUMSIZE, sumsize);
+					input_report_abs(info->input_dev, ABS_MT_PALM, palm);
+					info->finger[TouchID].lx = plasma_inject_tsp_x;
+					info->finger[TouchID].ly = plasma_inject_tsp_y;
 					
 					input_sync(info->input_dev);
 					
-					plasma_inject_tsp_upfirst = false;
+					pr_info("[tsp/exit] INJECTED - eid: %d, finger: %d, x: %d, y: %d, bw: %d, bh: %d, sum: %d, palm: %d, z: %d\n",
+							EventID, TouchID, plasma_inject_tsp_x, plasma_inject_tsp_y, bw, bh, sumsize, palm, z);
+					
+				} else if (plasma_ary_inject_tsp_x[0] > 0) {
+					
+					inject_ary_len = (sizeof(plasma_ary_inject_tsp_x) / sizeof(plasma_ary_inject_tsp_x[0]));
+					
+					for (i = 0; i < inject_ary_len; i++) {
+						
+						if (plasma_ary_inject_tsp_x[i] > 0) {
+							input_mt_slot(info->input_dev, TouchID);
+							input_mt_report_slot_state(info->input_dev, MT_TOOL_FINGER, 1 + (palm << 1));
+							input_report_key(info->input_dev, BTN_TOUCH, 1);
+							input_report_key(info->input_dev, BTN_TOOL_FINGER, 1);
+							input_report_abs(info->input_dev, ABS_MT_POSITION_X, plasma_ary_inject_tsp_x[i]);
+							input_report_abs(info->input_dev, ABS_MT_POSITION_Y, plasma_ary_inject_tsp_y[i]);
+							input_report_abs(info->input_dev, ABS_MT_TOUCH_MAJOR, max(bw, bh));
+							input_report_abs(info->input_dev, ABS_MT_TOUCH_MINOR, min(bw, bh));
+							
+							input_sync(info->input_dev);
+							
+							pr_info("[tsp/move] INJECTED - ctr: %d, eid: %d, finger: %d, x: %d, y: %d, bw: %d, bh: %d, sum: %d, palm: %d, z: %d\n",
+									i, EventID, TouchID, plasma_ary_inject_tsp_x[i], plasma_ary_inject_tsp_y[i], bw, bh, sumsize, palm, z);
+						} else {
+							break;
+						}
+					}
+					
+					// reset, because we only want to inject once.
+					memset(plasma_ary_inject_tsp_x, -1, sizeof(plasma_ary_inject_tsp_x));
+					memset(plasma_ary_inject_tsp_y, -1, sizeof(plasma_ary_inject_tsp_y));
+					plasma_inject_tsp_finger = -1;
 				}
-
-				input_mt_slot(info->input_dev, TouchID);
-				input_mt_report_slot_state(info->input_dev, MT_TOOL_FINGER, 1 + (palm << 1));
-				input_report_key(info->input_dev, BTN_TOUCH, 1);
-				input_report_key(info->input_dev, BTN_TOOL_FINGER, 1);
-				input_report_abs(info->input_dev, ABS_MT_POSITION_X, plasma_inject_tsp_x);
-				input_report_abs(info->input_dev, ABS_MT_POSITION_Y, plasma_inject_tsp_y);
-				input_report_abs(info->input_dev, ABS_MT_TOUCH_MAJOR, max(bw, bh));
-				input_report_abs(info->input_dev, ABS_MT_TOUCH_MINOR, min(bw, bh));
-				//input_report_abs(info->input_dev, ABS_MT_SUMSIZE, sumsize);
-				input_report_abs(info->input_dev, ABS_MT_PALM, palm);
-				info->finger[TouchID].lx = plasma_inject_tsp_x;
-				info->finger[TouchID].ly = plasma_inject_tsp_y;
-				
-				input_sync(info->input_dev);
-				
-				pr_info("[tsp/exit] INJECTED - eid: %d, finger: %d, x: %d, y: %d, bw: %d, bh: %d, sum: %d, palm: %d, z: %d\n",
-						EventID, TouchID, plasma_inject_tsp_x, plasma_inject_tsp_y, bw, bh, sumsize, palm, z);
 				
 				// reset, because we only want to inject once.
 				plasma_inject_tsp_x = -1;
+				plasma_inject_tsp_finger = -1;
 			}
 
 			input_mt_slot(info->input_dev, TouchID);
@@ -1695,17 +1802,17 @@ static unsigned char fts_event_handler_type_b(struct fts_ts_info *info,
 				info->flip_enable, info->mshover_enabled, info->mainscr_disable);*/
 #endif
 			info->finger[TouchID].mcount = 0;
-		}/* else if (EventID == EVENTID_HOVER_LEAVE_POINTER) {
+		} else if (EventID == EVENTID_HOVER_LEAVE_POINTER) {
 			if (info->hover_present) {
-				dev_info(&info->client->dev,
+				/*dev_info(&info->client->dev,
 					"[HR] tID:%d Ver[%02X%04X%01X%01X] ++\n",
 					TouchID,
 					info->panel_revision, info->fw_main_version_of_ic,
-					info->flip_enable, info->mshover_enabled);
+					info->flip_enable, info->mshover_enabled);*/
 				info->finger[TouchID].mcount = 0;
 				info->hover_present = false;
 			}
-		}*/ else if (EventID == EVENTID_MOTION_POINTER) {
+		} else if (EventID == EVENTID_MOTION_POINTER) {
 			info->finger[TouchID].mcount++;
 		}
 
@@ -1723,6 +1830,96 @@ static unsigned char fts_event_handler_type_b(struct fts_ts_info *info,
 			info->tsp_booster->dvfs_set(info->tsp_booster, info->touch_count);
 #endif
 	return LastLeftEvent;
+}
+	
+void plasma_tsp_tap(int f, int x, int y, int w)
+{
+	struct fts_ts_info *info = NULL;
+	int palm = 0;
+	int TouchID = 0;
+	
+	pr_info("[tsp/plasma_tsp_tap] starting - finger: %d, x: %d, y: %d, w: %d\n",
+			f, x, y, w);
+	
+	if (!plasma_fts_ts_info) {
+		pr_info("[tsp/%s] failed\n", __func__);
+		return;
+	}
+	
+	info = plasma_fts_ts_info;
+	
+	// lift.
+	input_mt_slot(info->input_dev, f);
+	input_mt_report_slot_state(info->input_dev, MT_TOOL_FINGER, 0);
+	input_report_key(info->input_dev, BTN_TOUCH, 0);
+	input_report_key(info->input_dev, BTN_TOOL_FINGER, 0);
+	
+	input_sync(info->input_dev);
+	
+	// press.
+	input_mt_slot(info->input_dev, f);
+	input_mt_report_slot_state(info->input_dev, MT_TOOL_FINGER, 1 + (palm << 1));
+	input_report_key(info->input_dev, BTN_TOUCH, 1);
+	input_report_key(info->input_dev, BTN_TOOL_FINGER, 1);
+	input_report_abs(info->input_dev, ABS_MT_POSITION_X, x);
+	input_report_abs(info->input_dev, ABS_MT_POSITION_Y, y);
+	input_report_abs(info->input_dev, ABS_MT_TOUCH_MAJOR, w);
+	input_report_abs(info->input_dev, ABS_MT_TOUCH_MINOR, w);
+	//input_report_abs(info->input_dev, ABS_MT_SUMSIZE, sumsize);
+	input_report_abs(info->input_dev, ABS_MT_PALM, palm);
+	info->finger[TouchID].lx = x;
+	info->finger[TouchID].ly = y;
+	
+	input_sync(info->input_dev);
+	
+	// lift.
+	input_mt_slot(info->input_dev, f);
+	input_mt_report_slot_state(info->input_dev, MT_TOOL_FINGER, 0);
+	input_report_key(info->input_dev, BTN_TOUCH, 0);
+	input_report_key(info->input_dev, BTN_TOOL_FINGER, 0);
+	
+	input_sync(info->input_dev);
+}
+	
+void plasma_tsp_lift(int f)
+{
+	struct fts_ts_info *info = NULL;
+	
+	pr_info("[tsp/%s] starting - finger: %d\n", __func__, f);
+	
+	if (!plasma_fts_ts_info) {
+		pr_info("[tsp/%s] failed\n", __func__);
+		return;
+	}
+	
+	info = plasma_fts_ts_info;
+	
+	// lift.
+	input_mt_slot(info->input_dev, f);
+	input_mt_report_slot_state(info->input_dev, MT_TOOL_FINGER, 0);
+	
+	if ((info->finger[f].state == EVENTID_ENTER_POINTER) ||
+		(info->finger[f].state == EVENTID_MOTION_POINTER)) {
+		info->touch_count--;
+		if (info->touch_count < 0)
+			info->touch_count = 0;
+	}
+	
+	info->finger[f].state = EVENTID_LEAVE_POINTER;
+	info->finger[f].mcount = 0;
+	plasma_finger_earlyup[f] = true;
+	
+	// update for changes outside of _enter and _exit.
+	plasma_tsp_touchcount = info->touch_count;
+	
+	input_sync(info->input_dev);
+	
+	if (info->touch_count < 1) {
+		pr_info("[tsp/plasma_tsp_lift] releasing all\n");
+		//fts_release_all_finger(info);
+		input_report_key(info->input_dev, BTN_TOUCH, 0);
+		input_report_key(info->input_dev, BTN_TOOL_FINGER, 0);
+	}
 }
 
 #ifdef FTS_SUPPORT_TA_MODE
@@ -2573,6 +2770,9 @@ static int fts_probe(struct i2c_client *client, const struct i2c_device_id *idp)
 #endif
 
 	plasma_input_dev_tsp = info->input_dev;
+	plasma_fts_ts_info = info;
+	
+	memset(plasma_finger_earlyup, 0, sizeof(plasma_finger_earlyup));
 
 	device_init_wakeup(&client->dev, 1);
 
@@ -2698,6 +2898,9 @@ static int fts_input_open(struct input_dev *dev)
 	unsigned char regAdd[4] = {0xB0, 0x01, 0x29, 0x41};
 
 	dev_dbg(&info->client->dev, "%s\n", __func__);
+	
+	if (flg_power_softsuspended)
+		goto out;
 
 #ifdef USE_OPEN_DWORK
 	schedule_delayed_work(&info->open_work,
@@ -2748,7 +2951,7 @@ static void fts_input_close(struct input_dev *dev)
 		fts_command(info, FLUSHBUFFER);
 	}
 	
-	info->fts_change_scan_rate(info, FTS_CMD_USLOW_SCAN);
+	//info->fts_change_scan_rate(info, FTS_CMD_USLOW_SCAN);
 
 	fts_stop_device(info);
 
@@ -2802,6 +3005,7 @@ static void fts_reinit_fac(struct fts_ts_info *info)
 	int rc;
 
 	info->touch_count = 0;
+	plasma_tsp_touchcount = 0;
 
 	fts_command(info, SLEEPOUT);
 	fts_delay(50);
@@ -2907,6 +3111,7 @@ static void fts_reinit(struct fts_ts_info *info)
 #endif
 
 	info->touch_count = 0;
+	plasma_tsp_touchcount = 0;
 #ifdef FTS_SUPPORT_2NDSCREEN_FLAG
 	info->SIDE_Flag = 0;
 	info->previous_SIDE_value = 0;
@@ -2939,7 +3144,11 @@ void fts_release_all_finger(struct fts_ts_info *info)
 
 		info->finger[i].state = EVENTID_LEAVE_POINTER;
 		info->finger[i].mcount = 0;
+		//plasma_finger_earlyup[i] = false;
 	}
+	
+	// update for changes outside of _enter and _exit.
+	plasma_tsp_touchcount = info->touch_count;
 
 	input_report_key(info->input_dev, BTN_TOUCH, 0);
 	input_report_key(info->input_dev, BTN_TOOL_FINGER, 0);
@@ -2976,15 +3185,82 @@ void fts_release_all_finger(struct fts_ts_info *info)
 		info->tsp_booster->dvfs_set(info->tsp_booster, -1);
 #endif
 }
+	
+void plasma_tsp_inject(bool onlyifdown, int f, int x, int y, int w)
+{
+	struct fts_ts_info *info = NULL;
+	int palm = 0;
+	
+	pr_info("[tsp/%s] injecting - onlyifdown: %d, finger: %d, x: %d, y: %d\n", __func__, onlyifdown, f, x, y);
+	
+	if (!plasma_fts_ts_info) {
+		pr_info("[tsp/%s] failed\n", __func__);
+		return;
+	}
+	
+	info = plasma_fts_ts_info;
+	
+	if (onlyifdown
+		&& info->finger[f].state != EVENTID_ENTER_POINTER
+		&& info->finger[f].state != EVENTID_MOTION_POINTER) {
+		pr_info("[tsp/%s] aborted because finger %d was not down\n", __func__, f);
+		return;
+	}
+	
+	// press.
+	input_mt_slot(info->input_dev, f);
+	input_mt_report_slot_state(info->input_dev, MT_TOOL_FINGER, 1 + (palm << 1));
+	input_report_key(info->input_dev, BTN_TOUCH, 1);
+	input_report_key(info->input_dev, BTN_TOOL_FINGER, 1);
+	input_report_abs(info->input_dev, ABS_MT_POSITION_X, x);
+	input_report_abs(info->input_dev, ABS_MT_POSITION_Y, y);
+	input_report_abs(info->input_dev, ABS_MT_TOUCH_MAJOR, w);
+	input_report_abs(info->input_dev, ABS_MT_TOUCH_MINOR, w);
+	//input_report_abs(info->input_dev, ABS_MT_SUMSIZE, sumsize);
+	input_report_abs(info->input_dev, ABS_MT_PALM, palm);
+	info->finger[f].lx = x;
+	info->finger[f].ly = y;
+	
+	input_sync(info->input_dev);
+}
+
+void plasma_tsp_liftall(void)
+{
+	unsigned int i;
+	
+	pr_info("[tsp/%s] releasing all fingers\n", __func__);
+	
+	if (!plasma_fts_ts_info) {
+		pr_info("[tsp/%s] failed\n", __func__);
+		return;
+	}
+	
+	for (i = 0; i < FINGER_MAX; i++) {
+		plasma_finger_earlyup[i] = true;
+	}
+	
+	fts_release_all_finger(plasma_fts_ts_info);
+	/*input_mt_slot(plasma_fts_ts_info->input_dev, 0);
+	input_mt_report_slot_state(plasma_fts_ts_info->input_dev, MT_TOOL_FINGER, 0);
+	input_report_key(plasma_fts_ts_info->input_dev, BTN_TOUCH, 0);
+	input_report_key(plasma_fts_ts_info->input_dev, BTN_TOOL_FINGER, 0);
+	input_sync(plasma_fts_ts_info->input_dev);*/
+}
 
 void plasma_tsp_suspend(void)
 {
+	if (plasma_input_dev_tsp == NULL)
+		return;
+	
 	fts_input_close(plasma_input_dev_tsp);
 }
 EXPORT_SYMBOL(plasma_tsp_suspend);
 	
 void plasma_tsp_resume(void)
 {
+	if (plasma_input_dev_tsp == NULL)
+		return;
+	
 	fts_input_open(plasma_input_dev_tsp);
 }
 EXPORT_SYMBOL(plasma_tsp_resume);
