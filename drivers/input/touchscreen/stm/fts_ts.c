@@ -164,6 +164,12 @@ static ssize_t enable_glove_store(struct device *dev,
 static ssize_t enable_glove_show(struct device *dev,
 								 struct device_attribute *attr, char *buf);
 
+static ssize_t test_store(struct device *dev,
+						  struct device_attribute *attr, const char *buf, size_t size);
+
+static ssize_t test_show(struct device *dev,
+						 struct device_attribute *attr, char *buf);
+
 static struct device_attribute tsp_attrs[] = {
 	__ATTR(enable_hover, (S_IRUGO | S_IWUSR | S_IWGRP),
 		   enable_hover_show,
@@ -171,6 +177,9 @@ static struct device_attribute tsp_attrs[] = {
 	__ATTR(enable_glove, (S_IRUGO | S_IWUSR | S_IWGRP),
 		   enable_glove_show,
 		   enable_glove_store),
+	__ATTR(test, (S_IRUGO | S_IWUSR | S_IWGRP),
+		   test_show,
+		   test_store),
 };
 
 #if defined(CONFIG_SECURE_TOUCH)
@@ -377,6 +386,41 @@ static ssize_t enable_glove_store(struct device *dev,
 		}
 		
 		pr_info("[tsp] STORE - glove mode has been set to: %d\n", flg_enable_glove);
+	}
+	
+	return size;
+}
+
+static ssize_t test_show(struct device *dev,
+								struct device_attribute *attr, char *buf)
+{
+	return sprintf(buf, "%d\n", 0);
+}
+
+static ssize_t test_store(struct device *dev,
+								 struct device_attribute *attr, const char *buf, size_t size)
+{
+	struct fts_ts_info *info = dev_get_drvdata(dev);
+	unsigned int ret;
+	unsigned int data;
+	
+	ret = sscanf(buf, "%u\n", &data);
+	
+	if(ret && data >= 0) {
+		
+		if (data == 0) {
+			fts_command(info, FTS_CMD_MSHOVER_OFF);
+		} else if (data == 1) {
+			fts_command(info, FTS_CMD_MSHOVER_ON);
+		} else if (data == 2) {
+			fts_command(info, FTS_CMD_SET_FAST_GLOVE_MODE);
+		} else if (data == 3) {
+			fts_enable_feature(info, FTS_FEATURE_COVER_GLASS, true);
+		} else if (data == 4) {
+			fts_enable_feature(info, FTS_FEATURE_COVER_GLASS, false);
+		}
+		
+		pr_info("[tsp] STORE - value: %d\n", data);
 	}
 	
 	return size;
@@ -1890,6 +1934,45 @@ static unsigned char fts_event_handler_type_b(struct fts_ts_info *info,
 			info->tsp_booster->dvfs_set(info->tsp_booster, info->touch_count);
 #endif
 	return LastLeftEvent;
+}
+	
+void plasma_tsp_glove_mode(bool mode)
+{
+	struct fts_ts_info *info = NULL;
+	
+	pr_info("[tsp/%s] starting\n", __func__);
+	
+	if (!plasma_fts_ts_info) {
+		pr_info("[tsp/%s] failed\n", __func__);
+		return;
+	}
+	
+	info = plasma_fts_ts_info;
+	
+	if (!mode) {
+		// turn glove mode off.
+		
+		fts_command(info, FTS_CMD_MSHOVER_OFF);
+		flg_enable_glove = false;
+		
+	} else if (mode == 1) {
+		// turn glove mode on.
+		
+		fts_command(info, FTS_CMD_MSHOVER_ON);
+		flg_enable_glove = true;
+		
+	} else if (mode > 1) {
+		// toggle glove mode.
+		
+		if (flg_enable_glove)
+			fts_command(info, FTS_CMD_MSHOVER_OFF);
+		else
+			fts_command(info, FTS_CMD_MSHOVER_ON);
+		
+		flg_enable_glove = !flg_enable_glove;
+	}
+	
+	pr_info("[tsp/%s] glove mode has been set to: %d\n", __func__, flg_enable_glove);
 }
 	
 void plasma_tsp_tap(int f, int x, int y, int w)
