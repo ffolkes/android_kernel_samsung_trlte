@@ -87,17 +87,31 @@ struct fts_touchkey fts_touchkeys[] = {
 
 extern int get_lcd_attached(char*);
 
+#define SCREEN_X_MAX		1440
+#define SCREEN_X_MID		720
+#define SCREEN_Y_MAX		2560
+#define SCREEN_Y_MID		1280
+
 extern void plasma_process_tsp_touch_enter(int finger, int touchcount);
 extern int plasma_process_tsp_touch_move(int finger, int touchcount, int x, int y, int w, int h);
 extern void plasma_process_tsp_touch_exit(int finger, int touchcount, int x, int y, int pressure);
 extern bool plasma_tsp_check_to_stay_on(void);
 extern bool flg_power_softsuspended;
+extern bool flg_tsp_lockedout;
+extern bool flg_epen_tsp_block;
+extern bool flg_tsp_rollingdrag;
+extern int flg_tsp_rollingdrag_direction;
+extern int plasma_tsp_rollingdrag_override_duration;
 extern int plasma_inject_tsp_x;
 extern int plasma_inject_tsp_y;
 extern int plasma_inject_tsp_finger;
+extern int plasma_inject_tsp_delay;
 extern bool plasma_inject_tsp_upfirst;
+extern int plasma_ary_inject_tsp_f[200];
 extern int plasma_ary_inject_tsp_x[200];
 extern int plasma_ary_inject_tsp_y[200];
+extern int plasma_ary_inject_tsp_w[200];
+extern int plasma_ary_inject_tsp_h[200];
 extern bool flg_voice_allowturnoff;
 //extern bool flg_epen_writing;
 //extern bool flg_epen_hovering;
@@ -108,7 +122,9 @@ struct input_dev *plasma_input_dev_tsp = NULL;
 struct fts_ts_info *plasma_fts_ts_info;
 //void tsp_releaseall(void);
 //extern int flg_ctr_inputbooster_typingbooster;
+static int plasma_finger_state[FINGER_MAX];
 static int plasma_finger_earlyup[FINGER_MAX];
+static bool flg_tsp_rollingdrag_abort = false;
 
 extern int boot_mode_recovery;
 #ifdef CONFIG_SAMSUNG_LPM_MODE
@@ -1199,6 +1215,7 @@ static unsigned char fts_event_handler_type_b(struct fts_ts_info *info,
 	static int longpress_release[FINGER_MAX] = {0, };
 #endif
 	unsigned char string_clear = 0;
+	bool flg_plasma_injected_extrafinger = false;
 
 	for (EventNum = 0; EventNum < LeftEvent; EventNum++) {
 #if 0
@@ -1424,6 +1441,7 @@ static unsigned char fts_event_handler_type_b(struct fts_ts_info *info,
 			flg_voice_allowturnoff = false;
 			info->touch_count++;
 			plasma_finger_earlyup[TouchID] = false;
+			plasma_finger_state[TouchID] = true;
 				
 			plasma_process_tsp_touch_enter(TouchID, info->touch_count);
 				
@@ -1448,6 +1466,8 @@ static unsigned char fts_event_handler_type_b(struct fts_ts_info *info,
 				pr_info("[tsp/move] finger %d is being ignored\n", TouchID);
 				return LastLeftEvent;
 			}
+				
+			plasma_finger_state[TouchID] = true;
 			
 			// maybe for future use.
 			/*if (flg_epen_hovering || flg_epen_writing) {
@@ -1532,34 +1552,91 @@ static unsigned char fts_event_handler_type_b(struct fts_ts_info *info,
 					inject_ary_len = (sizeof(plasma_ary_inject_tsp_x) / sizeof(plasma_ary_inject_tsp_x[0]));
 					
 					for (i = 0; i < inject_ary_len; i++) {
+						//int this_finger = TouchID;
 						
 						if (plasma_ary_inject_tsp_x[i] > 0) {
-							input_mt_slot(info->input_dev, TouchID);
+							if (plasma_ary_inject_tsp_f[i] > 0
+								&& (!plasma_finger_state[plasma_ary_inject_tsp_f[i]]
+									|| info->touch_count < 2
+									|| (info->finger[plasma_ary_inject_tsp_f[i]].state != EVENTID_ENTER_POINTER
+										&& info->finger[plasma_ary_inject_tsp_f[i]].state != EVENTID_MOTION_POINTER))) {
+										pr_info("[tsp/move] FINGER ALREADY UP, skipping - f: %d, ctr: %d, delay: %d ms, finger: %d, x: %d, y: %d, bw: %d, bh: %d, sum: %d, palm: %d, z: %d\n",
+												TouchID, i, plasma_inject_tsp_delay, plasma_ary_inject_tsp_f[i], plasma_ary_inject_tsp_x[i], plasma_ary_inject_tsp_y[i], plasma_ary_inject_tsp_w[i], plasma_ary_inject_tsp_h[i], sumsize, palm, z);
+										continue;
+									} else if (plasma_ary_inject_tsp_f[i] < 0) {
+										pr_info("[tsp/move] FINGER UNPRIMED! - f: %d, ctr: %d, delay: %d ms, finger: %d, x: %d, y: %d, bw: %d, bh: %d, sum: %d, palm: %d, z: %d\n",
+												TouchID, i, plasma_inject_tsp_delay, plasma_ary_inject_tsp_f[i], plasma_ary_inject_tsp_x[i], plasma_ary_inject_tsp_y[i], plasma_ary_inject_tsp_w[i], plasma_ary_inject_tsp_h[i], sumsize, palm, z);
+										plasma_ary_inject_tsp_f[i] = 0;
+									} else if (plasma_ary_inject_tsp_f[i] > 0) {
+										flg_plasma_injected_extrafinger = true;
+									}
+							input_mt_slot(info->input_dev, plasma_ary_inject_tsp_f[i]);
 							input_mt_report_slot_state(info->input_dev, MT_TOOL_FINGER, 1 + (palm << 1));
 							input_report_key(info->input_dev, BTN_TOUCH, 1);
 							input_report_key(info->input_dev, BTN_TOOL_FINGER, 1);
 							input_report_abs(info->input_dev, ABS_MT_POSITION_X, plasma_ary_inject_tsp_x[i]);
 							input_report_abs(info->input_dev, ABS_MT_POSITION_Y, plasma_ary_inject_tsp_y[i]);
-							input_report_abs(info->input_dev, ABS_MT_TOUCH_MAJOR, max(bw, bh));
-							input_report_abs(info->input_dev, ABS_MT_TOUCH_MINOR, min(bw, bh));
+							input_report_abs(info->input_dev, ABS_MT_TOUCH_MAJOR, max(plasma_ary_inject_tsp_w[i], plasma_ary_inject_tsp_h[i]));
+							input_report_abs(info->input_dev, ABS_MT_TOUCH_MINOR, min(plasma_ary_inject_tsp_w[i], plasma_ary_inject_tsp_h[i]));
 							
 							input_sync(info->input_dev);
 							
-							pr_info("[tsp/move] INJECTED - ctr: %d, eid: %d, finger: %d, x: %d, y: %d, bw: %d, bh: %d, sum: %d, palm: %d, z: %d\n",
-									i, EventID, TouchID, plasma_ary_inject_tsp_x[i], plasma_ary_inject_tsp_y[i], bw, bh, sumsize, palm, z);
+							if (plasma_inject_tsp_delay > 0) {
+								if (i < inject_ary_len - 1) {
+									if (plasma_ary_inject_tsp_f[i+1] > plasma_ary_inject_tsp_f[i])
+										continue;
+								}
+									
+								usleep_range(plasma_inject_tsp_delay * 1000, plasma_inject_tsp_delay * 1000);
+							}
+							
+							pr_info("[tsp/move] INJECTED - f: %d, ctr: %d, delay: %d ms, finger: %d, x: %d, y: %d, bw: %d, bh: %d, sum: %d, palm: %d, z: %d\n",
+									TouchID, i, plasma_inject_tsp_delay, plasma_ary_inject_tsp_f[i], plasma_ary_inject_tsp_x[i], plasma_ary_inject_tsp_y[i], plasma_ary_inject_tsp_w[i], plasma_ary_inject_tsp_h[i], sumsize, palm, z);
+							
+							if (plasma_ary_inject_tsp_f[i] > 0
+								&& (!plasma_finger_state[plasma_ary_inject_tsp_f[i]]
+									|| info->touch_count < 2
+									|| (info->finger[plasma_ary_inject_tsp_f[i]].state != EVENTID_ENTER_POINTER
+										&& info->finger[plasma_ary_inject_tsp_f[i]].state != EVENTID_MOTION_POINTER))) {
+										
+										pr_info("[tsp/move] FINGER ALREADY UP, releasing - f: %d, ctr: %d, delay: %d ms, finger: %d, x: %d, y: %d, bw: %d, bh: %d, sum: %d, palm: %d, z: %d\n",
+												TouchID, i, plasma_inject_tsp_delay, plasma_ary_inject_tsp_f[i], plasma_ary_inject_tsp_x[i], plasma_ary_inject_tsp_y[i], plasma_ary_inject_tsp_w[i], plasma_ary_inject_tsp_h[i], sumsize, palm, z);
+										
+										input_mt_slot(info->input_dev, plasma_ary_inject_tsp_f[i]);
+										input_mt_report_slot_state(info->input_dev, MT_TOOL_FINGER, 0);
+										input_sync(info->input_dev);
+									}
 						} else {
 							break;
 						}
 					}
 					
-					// reset, because we only want to inject once.
-					memset(plasma_ary_inject_tsp_x, -1, sizeof(plasma_ary_inject_tsp_x));
-					memset(plasma_ary_inject_tsp_y, -1, sizeof(plasma_ary_inject_tsp_y));
+					if (flg_plasma_injected_extrafinger
+						&& (!plasma_finger_state[1]
+							|| info->touch_count < 2
+							|| (info->finger[1].state != EVENTID_ENTER_POINTER
+								&& info->finger[1].state != EVENTID_MOTION_POINTER))) {
+								pr_info("[tsp/move] FINGER ALREADY UP, releasing finger 1 - f: %d\n", TouchID);
+								
+								input_mt_slot(info->input_dev, 1);
+								input_mt_report_slot_state(info->input_dev, MT_TOOL_FINGER, 0);
+								input_sync(info->input_dev);
+							}
+					
 					plasma_inject_tsp_finger = -1;
+					plasma_inject_tsp_delay = 0;
+					flg_plasma_injected_extrafinger = false;
 					
 					pr_info("[tsp/move] CURRENT - eid: %d, finger: %d, x: %d, y: %d, bw: %d, bh: %d, sum: %d, palm: %d, z: %d\n",
 							EventID, TouchID, x, y, bw, bh, sumsize, palm, z);
 				}
+				
+				// reset, because we only want to inject once.
+				memset(plasma_ary_inject_tsp_f, -1, sizeof(plasma_ary_inject_tsp_f));
+				memset(plasma_ary_inject_tsp_x, -1, sizeof(plasma_ary_inject_tsp_x));
+				memset(plasma_ary_inject_tsp_y, -1, sizeof(plasma_ary_inject_tsp_y));
+				memset(plasma_ary_inject_tsp_w, -1, sizeof(plasma_ary_inject_tsp_w));
+				memset(plasma_ary_inject_tsp_h, -1, sizeof(plasma_ary_inject_tsp_h));
 			}
 
 			input_mt_slot(info->input_dev, TouchID);
@@ -1586,6 +1663,9 @@ static unsigned char fts_event_handler_type_b(struct fts_ts_info *info,
 #endif
 			info->finger[TouchID].lx = x;
 			info->finger[TouchID].ly = y;
+				
+			//pr_info("[tsp/move] event sent - eid: %d, finger: %d, x: %d, y: %d, bw: %d, bh: %d, sum: %d, palm: %d, z: %d\n",
+			//		EventID, TouchID, x, y, bw, bh, sumsize, palm, z);
 
 			break;
 
@@ -1603,6 +1683,8 @@ static unsigned char fts_event_handler_type_b(struct fts_ts_info *info,
 			}
 
 			info->touch_count--;
+				
+			plasma_finger_state[TouchID] = false;
 
 			//pr_info("[tsp] finger: %d OUT eventid: %d\n", TouchID, EventID);
 			
@@ -1617,11 +1699,15 @@ static unsigned char fts_event_handler_type_b(struct fts_ts_info *info,
 			// todo: make this into a function.
 			if (plasma_inject_tsp_finger == TouchID) {
 				
+				flg_tsp_rollingdrag_abort = true;
+				
 				if (plasma_inject_tsp_x > 0) {
 					
 					if (plasma_inject_tsp_upfirst) {
 						
 						pr_info("[tsp/exit] INJECTING - lifting finger first\n");
+						
+						usleep_range(5000, 10000);
 						
 						input_mt_slot(info->input_dev, 0);
 						input_mt_report_slot_state(info->input_dev, MT_TOOL_FINGER, 0);
@@ -1632,6 +1718,8 @@ static unsigned char fts_event_handler_type_b(struct fts_ts_info *info,
 						
 						plasma_inject_tsp_upfirst = false;
 					}
+					
+					usleep_range(5000, 10000);
 
 					input_mt_slot(info->input_dev, TouchID);
 					input_mt_report_slot_state(info->input_dev, MT_TOOL_FINGER, 1 + (palm << 1));
@@ -1658,27 +1746,32 @@ static unsigned char fts_event_handler_type_b(struct fts_ts_info *info,
 					for (i = 0; i < inject_ary_len; i++) {
 						
 						if (plasma_ary_inject_tsp_x[i] > 0) {
+							if (plasma_ary_inject_tsp_f[i] > 0)
+								continue;
 							input_mt_slot(info->input_dev, TouchID);
 							input_mt_report_slot_state(info->input_dev, MT_TOOL_FINGER, 1 + (palm << 1));
 							input_report_key(info->input_dev, BTN_TOUCH, 1);
 							input_report_key(info->input_dev, BTN_TOOL_FINGER, 1);
 							input_report_abs(info->input_dev, ABS_MT_POSITION_X, plasma_ary_inject_tsp_x[i]);
 							input_report_abs(info->input_dev, ABS_MT_POSITION_Y, plasma_ary_inject_tsp_y[i]);
-							input_report_abs(info->input_dev, ABS_MT_TOUCH_MAJOR, max(bw, bh));
-							input_report_abs(info->input_dev, ABS_MT_TOUCH_MINOR, min(bw, bh));
+							input_report_abs(info->input_dev, ABS_MT_TOUCH_MAJOR, max(plasma_ary_inject_tsp_w[i], plasma_ary_inject_tsp_h[i]));
+							input_report_abs(info->input_dev, ABS_MT_TOUCH_MINOR, min(plasma_ary_inject_tsp_w[i], plasma_ary_inject_tsp_h[i]));
 							
 							input_sync(info->input_dev);
 							
 							pr_info("[tsp/move] INJECTED - ctr: %d, eid: %d, finger: %d, x: %d, y: %d, bw: %d, bh: %d, sum: %d, palm: %d, z: %d\n",
-									i, EventID, TouchID, plasma_ary_inject_tsp_x[i], plasma_ary_inject_tsp_y[i], bw, bh, sumsize, palm, z);
+									i, EventID, TouchID, plasma_ary_inject_tsp_x[i], plasma_ary_inject_tsp_y[i], plasma_ary_inject_tsp_w[i], plasma_ary_inject_tsp_h[i], sumsize, palm, z);
 						} else {
 							break;
 						}
 					}
 					
 					// reset, because we only want to inject once.
+					memset(plasma_ary_inject_tsp_f, -1, sizeof(plasma_ary_inject_tsp_f));
 					memset(plasma_ary_inject_tsp_x, -1, sizeof(plasma_ary_inject_tsp_x));
 					memset(plasma_ary_inject_tsp_y, -1, sizeof(plasma_ary_inject_tsp_y));
+					memset(plasma_ary_inject_tsp_w, -1, sizeof(plasma_ary_inject_tsp_w));
+					memset(plasma_ary_inject_tsp_h, -1, sizeof(plasma_ary_inject_tsp_h));
 					plasma_inject_tsp_finger = -1;
 				}
 				
@@ -1975,11 +2068,337 @@ void plasma_tsp_glove_mode(bool mode)
 	pr_info("[tsp/%s] glove mode has been set to: %d\n", __func__, flg_enable_glove);
 }
 	
+void plasma_tsp_drag(int f, int x1, int y1, int x2, int y2, int w, int steps, int duration, bool rollingdrag)
+{
+	struct fts_ts_info *info = NULL;
+	unsigned int current_finger = 0;
+	int x_diff;
+	int y_diff;
+	int x_step = 0;
+	int y_step = 0;
+	unsigned int t_step_ms;
+	unsigned int t_step_us;
+	int x_new = x1;
+	int y_new = y1;
+	int i;
+	int step_multiplier = 1;
+	int step_divider = 1;
+	
+	pr_info("[tsp/%s] starting - finger: %d, x1: %d, y1: %d to x2: %d, y2: %d, w: %d, rolling: %d\n",
+			__func__, f, x1, y1, x2, y2, w, rollingdrag);
+	
+	if (!plasma_fts_ts_info) {
+		pr_info("[tsp/%s] failed\n", __func__);
+		return;
+	}
+	
+	info = plasma_fts_ts_info;
+	
+	if (flg_epen_tsp_block) {
+		pr_info("[tsp/%s] failed, epen in use\n", __func__);
+		return;
+	}
+	
+	if (!steps)
+		steps = 5;
+	
+	if (!duration)
+		duration = 500;
+	
+	// lift.
+	input_mt_slot(info->input_dev, f);
+	input_mt_report_slot_state(info->input_dev, MT_TOOL_FINGER, 0);
+	input_report_key(info->input_dev, BTN_TOUCH, 0);
+	input_report_key(info->input_dev, BTN_TOOL_FINGER, 0);
+	
+	input_sync(info->input_dev);
+	
+	// block all input.
+	flg_tsp_lockedout = true;
+	
+	// reset the abort flag.
+	flg_tsp_rollingdrag_abort = false;
+	
+	x_diff = (x1 - x2);
+	y_diff = (y1 - y2);
+	
+	// calculate step distance.
+	if (x_diff != 0)
+		x_step = (x_diff / steps);
+	
+	if (y_diff != 0)
+		y_step = (y_diff / steps);
+	
+	if (!x_diff && !y_diff) {
+		pr_info("[tsp/%s] failed, no difference in coordinates\n", __func__);
+		return;
+	}
+	
+	// finger down, and start moving.
+	for (i = 0; i < steps; i++) {
+		
+		pr_info("[tsp/%s] i: %d, f: %d, x_diff: %d, y_diff: %d, x_step: %d, y_step: %d, t_step: %d, dur_override: %d\n",
+				__func__, i, current_finger, x_diff, y_diff, x_step, y_step, t_step_ms, plasma_tsp_rollingdrag_override_duration);
+		
+		if (flg_tsp_rollingdrag_abort) {
+			pr_info("[tsp/%s] aborting i: %d, flg_tsp_rollingdrag_abort true\n",
+					__func__, i);
+			goto plasma_tsp_drag_end;
+		}
+		
+		if (rollingdrag
+			&& (!flg_tsp_rollingdrag
+				|| plasma_tsp_touchcount < 1)) {
+			pr_info("[tsp/%s] aborting i: %d, flg_tsp_rollingdrag false\n",
+					__func__, i);
+			break;
+		}
+		
+		// calculate time step every time in case we change its weight.
+		if (plasma_tsp_rollingdrag_override_duration) {
+			
+			t_step_ms = max(1, (plasma_tsp_rollingdrag_override_duration / steps));
+			
+			if (plasma_tsp_rollingdrag_override_duration <= 100)
+				step_multiplier = 2;
+			else {
+				step_multiplier = 1;
+
+				if (plasma_tsp_rollingdrag_override_duration > 4500)
+					step_divider = 2;
+				else
+					step_divider = 1;
+			}
+			
+		} else {
+			t_step_ms = (duration / steps);
+			step_multiplier = 1;
+			step_divider = 1;
+		}
+		
+		t_step_us = (t_step_ms * 1000);
+		
+		// are we going up or down?
+		if (!rollingdrag
+			|| flg_tsp_rollingdrag_direction) {
+			
+			// add the opposite.
+			if (x_step) {
+				
+				if (i > 0)
+					x_new += ((-x_step) * step_multiplier) / step_divider;
+				
+				if (x_new > SCREEN_X_MAX
+					|| x_new < 0) {
+					pr_info("[tsp/%s] x has gone off the screen\n", __func__);
+					//break;
+				}
+				
+				/*x_next = (x_new + -x_step);
+				 
+				 if (x_next > x2) {
+				 pr_info("[tsp/%s] adding remainder of x\n", __func__);
+				 x_new = x_next;
+				 }*/
+			}
+			
+			if (y_step) {
+				
+				// are we scrolling up or down?
+				if (!rollingdrag
+					|| flg_tsp_rollingdrag_direction < 0) {
+					// finger down.
+					
+					if (i > 0)
+						y_new += ((-y_step) * step_multiplier) / step_divider;
+					
+					if (rollingdrag) {
+						if (y_new > y1) {
+							pr_info("[tsp/%s] DOWN - y (%d) has gone below destination, y1: %d\n",
+									__func__, y_new, y1);
+							y_new = y1;
+							i = steps - 1;  // submit the event, then restart.
+						}
+						
+						if (y_new < y2) {
+							pr_info("[tsp/%s] DOWN - y (%d) has gone above destination, y2: %d\n",
+									__func__, y_new, y2);
+							y_new = y2;
+							i = steps - 1;  // submit the event, then restart.
+						}
+					}
+					
+				} else {
+					// finger up.
+					
+					if (i > 0)
+						y_new += (y_step * step_multiplier) / step_divider;
+					
+					if (rollingdrag) {
+						if (y_new < y2) {
+							pr_info("[tsp/%s] UP - y (%d) has gone above destination, y2: %d\n",
+									__func__, y_new, y2);
+							y_new = y2;
+							i = steps - 1;  // submit the event, then restart.
+						}
+						
+						if (y_new > y1) {
+							pr_info("[tsp/%s] UP - y (%d) has gone below destination, y1: %d\n",
+									__func__, y_new, y1);
+							y_new = y1;
+							i = steps - 1;  // submit the event, then restart.
+						}
+					}
+				}
+				
+				if (y_new > SCREEN_Y_MAX
+					|| y_new < 0) {
+					pr_info("[tsp/%s] y has gone off the screen\n", __func__);
+					y_new = SCREEN_Y_MAX;
+					i = steps - 1;  // submit the event, then restart.
+				}
+			}
+			
+			//pr_info("[tsp/%s] finger %d moving to x: %d, y: %d then waiting for %d ms, step_multiplier: %d, i: %d\n",
+			//		__func__, current_finger, x_new, y_new, t_step_ms, step_multiplier, i);
+			
+			input_mt_slot(info->input_dev, current_finger);
+			input_mt_report_slot_state(info->input_dev, MT_TOOL_FINGER, 1 + (0 << 1));
+			input_report_key(info->input_dev, BTN_TOUCH, 1);
+			input_report_key(info->input_dev, BTN_TOOL_FINGER, 1);
+			input_report_abs(info->input_dev, ABS_MT_POSITION_X, x_new);
+			input_report_abs(info->input_dev, ABS_MT_POSITION_Y, y_new);
+			input_report_abs(info->input_dev, ABS_MT_TOUCH_MAJOR, w);
+			input_report_abs(info->input_dev, ABS_MT_TOUCH_MINOR, w);
+			input_report_abs(info->input_dev, ABS_MT_PALM, 0);
+			info->finger[current_finger].lx = x_new;
+			info->finger[current_finger].ly = y_new;
+			
+			input_sync(info->input_dev);
+			
+		} else {
+			// we're idling.
+			
+			//pr_info("[tsp/%s] finger %d idling at x: %d, y: %d then waiting for %d ms, i: %d\n",
+			//		__func__, f, x_new, y_new, t_step_ms, i);
+		}
+		
+		if (flg_tsp_rollingdrag_abort) {
+			pr_info("[tsp/%s] aborting i: %d, flg_tsp_rollingdrag_abort true\n",
+					__func__, i);
+			goto plasma_tsp_drag_end;
+		}
+		
+		if (rollingdrag
+			&& (!flg_tsp_rollingdrag
+				|| plasma_tsp_touchcount < 1)) {
+			pr_info("[tsp/%s] aborting i: %d, flg_tsp_rollingdrag false\n",
+					__func__, i);
+			break;
+		}
+		
+		if (rollingdrag
+			&& i == steps - 1) {
+			
+			pr_info("[tsp/%s] restarting loop on step %d, currentfinger: %d\n", __func__, i, current_finger);
+			
+			if (flg_tsp_rollingdrag) {
+				// we're rolling up or down, so lift and repeat.
+				
+				// are we scrolling up or down?
+				if (flg_tsp_rollingdrag_direction < 0) {
+					x_new = x1;
+					y_new = y1;
+				} else {
+					x_new = x2;
+					y_new = y2;
+				}
+				
+				// put the next finger down.
+				//pr_info("[tsp/%s] finger %d premoving to x: %d, y: %d then waiting for %d ms, i: %d\n",
+				//		__func__, current_finger, x_new, y_new, t_step_ms, i);
+				
+				/*input_mt_slot(info->input_dev, !current_finger);
+				input_mt_report_slot_state(info->input_dev, MT_TOOL_FINGER, 1 + (0 << 1));
+				input_report_key(info->input_dev, BTN_TOUCH, 1);
+				input_report_key(info->input_dev, BTN_TOOL_FINGER, 1);
+				input_report_abs(info->input_dev, ABS_MT_POSITION_X, x_new);
+				input_report_abs(info->input_dev, ABS_MT_POSITION_Y, y_new);
+				input_report_abs(info->input_dev, ABS_MT_TOUCH_MAJOR, w);
+				input_report_abs(info->input_dev, ABS_MT_TOUCH_MINOR, w);
+				input_report_abs(info->input_dev, ABS_MT_PALM, 0);
+				info->finger[!current_finger].lx = x_new;
+				info->finger[!current_finger].ly = y_new;
+				
+				input_sync(info->input_dev);*/
+				
+				// lift current finger.
+				input_mt_slot(info->input_dev, current_finger);
+				input_mt_report_slot_state(info->input_dev, MT_TOOL_FINGER, 0);
+				//input_report_key(info->input_dev, BTN_TOUCH, 0);
+				//input_report_key(info->input_dev, BTN_TOOL_FINGER, 0);
+				
+				input_sync(info->input_dev);
+				
+				//current_finger = !current_finger;
+			}
+			
+			// reset counter to 0, but anticipate the ++ at the end of this loop.
+			i = -1;
+			
+		}/* else {*/
+			
+			if (t_step_ms < 50)
+				usleep_range(t_step_us - 500, t_step_us + 500);
+			else
+				msleep(t_step_ms);
+			
+			if (flg_tsp_rollingdrag_abort) {
+				pr_info("[tsp/%s] aborting i: %d, flg_tsp_rollingdrag_abort true\n",
+						__func__, i);
+				goto plasma_tsp_drag_end;
+			}
+			
+			if (rollingdrag
+				&& (!flg_tsp_rollingdrag
+					|| plasma_tsp_touchcount < 1)) {
+				pr_info("[tsp/%s] aborting i: %d, flg_tsp_rollingdrag false\n",
+						__func__, i);
+				break;
+			}
+		//}
+	}
+	
+plasma_tsp_drag_end:
+	
+	pr_info("[tsp/%s] ending, lifting finger %d\n", __func__, f);
+	
+	// lift.
+	input_mt_slot(info->input_dev, 0);
+	input_mt_report_slot_state(info->input_dev, MT_TOOL_FINGER, 0);
+	input_mt_slot(info->input_dev, 1);
+	input_mt_report_slot_state(info->input_dev, MT_TOOL_FINGER, 0);
+	input_report_key(info->input_dev, BTN_TOUCH, 0);
+	input_report_key(info->input_dev, BTN_TOOL_FINGER, 0);
+	
+	input_sync(info->input_dev);
+	
+	pr_info("[tsp/%s] ending, lifted finger %d\n", __func__, f);
+	
+	// reset the abort.
+	flg_tsp_rollingdrag_abort = false;
+	
+	// reset.
+	plasma_tsp_rollingdrag_override_duration = 0;
+	
+	// release the block, unless it's a rolling drag, which we do elsewhere.
+	if (!rollingdrag)
+		flg_tsp_lockedout = false;
+}
+	
 void plasma_tsp_tap(int f, int x, int y, int w)
 {
 	struct fts_ts_info *info = NULL;
-	int palm = 0;
-	int TouchID = 0;
 	
 	pr_info("[tsp/plasma_tsp_tap] starting - finger: %d, x: %d, y: %d, w: %d\n",
 			f, x, y, w);
@@ -2001,17 +2420,16 @@ void plasma_tsp_tap(int f, int x, int y, int w)
 	
 	// press.
 	input_mt_slot(info->input_dev, f);
-	input_mt_report_slot_state(info->input_dev, MT_TOOL_FINGER, 1 + (palm << 1));
+	input_mt_report_slot_state(info->input_dev, MT_TOOL_FINGER, 1 + (0 << 1));
 	input_report_key(info->input_dev, BTN_TOUCH, 1);
 	input_report_key(info->input_dev, BTN_TOOL_FINGER, 1);
 	input_report_abs(info->input_dev, ABS_MT_POSITION_X, x);
 	input_report_abs(info->input_dev, ABS_MT_POSITION_Y, y);
 	input_report_abs(info->input_dev, ABS_MT_TOUCH_MAJOR, w);
 	input_report_abs(info->input_dev, ABS_MT_TOUCH_MINOR, w);
-	//input_report_abs(info->input_dev, ABS_MT_SUMSIZE, sumsize);
-	input_report_abs(info->input_dev, ABS_MT_PALM, palm);
-	info->finger[TouchID].lx = x;
-	info->finger[TouchID].ly = y;
+	input_report_abs(info->input_dev, ABS_MT_PALM, 0);
+	info->finger[f].lx = x;
+	info->finger[f].ly = y;
 	
 	input_sync(info->input_dev);
 	
@@ -2050,12 +2468,11 @@ void plasma_tsp_lift(int f)
 	
 	info->finger[f].state = EVENTID_LEAVE_POINTER;
 	info->finger[f].mcount = 0;
+	plasma_finger_state[f] = false;
 	plasma_finger_earlyup[f] = true;
 	
 	// update for changes outside of _enter and _exit.
 	plasma_tsp_touchcount = info->touch_count;
-	
-	input_sync(info->input_dev);
 	
 	if (info->touch_count < 1) {
 		pr_info("[tsp/plasma_tsp_lift] releasing all\n");
@@ -2063,6 +2480,8 @@ void plasma_tsp_lift(int f)
 		input_report_key(info->input_dev, BTN_TOUCH, 0);
 		input_report_key(info->input_dev, BTN_TOOL_FINGER, 0);
 	}
+	
+	input_sync(info->input_dev);
 }
 
 #ifdef FTS_SUPPORT_TA_MODE
@@ -2915,6 +3334,7 @@ static int fts_probe(struct i2c_client *client, const struct i2c_device_id *idp)
 	plasma_input_dev_tsp = info->input_dev;
 	plasma_fts_ts_info = info;
 	
+	memset(plasma_finger_state, 0, sizeof(plasma_finger_state));
 	memset(plasma_finger_earlyup, 0, sizeof(plasma_finger_earlyup));
 
 	device_init_wakeup(&client->dev, 1);
@@ -3099,7 +3519,7 @@ static void fts_input_close(struct input_dev *dev)
 		fts_command(info, FLUSHBUFFER);
 	}
 	
-	//info->fts_change_scan_rate(info, FTS_CMD_USLOW_SCAN);
+	info->fts_change_scan_rate(info, FTS_CMD_USLOW_SCAN);
 
 	fts_stop_device(info);
 
@@ -3292,6 +3712,7 @@ void fts_release_all_finger(struct fts_ts_info *info)
 
 		info->finger[i].state = EVENTID_LEAVE_POINTER;
 		info->finger[i].mcount = 0;
+		plasma_finger_state[i] = false;
 		//plasma_finger_earlyup[i] = false;
 	}
 	
