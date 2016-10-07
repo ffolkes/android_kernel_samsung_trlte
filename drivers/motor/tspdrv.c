@@ -105,6 +105,9 @@ static int g_nmajor;
     #include "VibeOSKernelLinuxTime.c"
 #endif
 
+extern unsigned int sttg_tk_vib_duration;
+extern unsigned int sttg_tk_vib_strength;
+
 static int set_vibetonz(int timeout, int8_t strength);
 
 static unsigned int vib_duration = 0;
@@ -179,8 +182,8 @@ static int set_vibetonz(int timeout, int8_t strength)
 			ImmVibeSPI_ForceOut_AmpEnable(0);
 		}
 		if (vib_duration) {
-			cancel_delayed_work_sync(&work_viboff);
-			schedule_delayed_work(&work_viboff, msecs_to_jiffies(vib_duration));
+			cancel_delayed_work(&work_viboff);
+			queue_delayed_work(wq_vib, &work_viboff, msecs_to_jiffies(vib_duration));
 			vib_duration = 0;
 			vib_strength = 0;
 		}
@@ -259,7 +262,7 @@ static int get_time_for_vibetonz(struct timed_output_dev *dev)
 
 }
 
-void controlVibrator(unsigned int duration, unsigned int strength)
+void controlVibrator(unsigned int duration, unsigned int strength, unsigned int extend)
 {
 	if (vib_duration) {
 		printk(KERN_DEBUG "[tspdrv/controlVibrator] ALREADY PENDING - skipped: (on: %d ms, strength: %d)\n", duration, strength);
@@ -270,11 +273,25 @@ void controlVibrator(unsigned int duration, unsigned int strength)
 	vib_duration = duration;
 	vib_strength = strength;
 	
+	if (extend == 2
+		&& delayed_work_pending(&work_viboff)) {
+		vib_duration = 0;
+		vib_strength = 0;
+		printk(KERN_DEBUG "[tspdrv/controlVibrator] vibrator already on, dropping request\n");
+		return;
+	}
+	
 	//hrtimer_cancel(&timer);
-	if (cancel_delayed_work_sync(&work_viboff)) {
-		// work was pending, just extend it.
-		schedule_delayed_work(&work_viboff, msecs_to_jiffies(duration));
-		printk(KERN_DEBUG "[tspdrv/controlVibrator] extended another %d ms\n", duration);
+	if (cancel_delayed_work(&work_viboff)) {
+		// work was pending, should we just extend it?
+		if (extend == 1) {
+			queue_delayed_work(wq_vib, &work_viboff, msecs_to_jiffies(duration));
+			printk(KERN_DEBUG "[tspdrv/controlVibrator] extended another %d ms\n", duration);
+		} else {
+			// stop the vibrator, and start a new event instead.
+			queue_delayed_work(wq_vib, &work_viboff, 0);
+			queue_delayed_work(wq_vib, &work_vibon, 0);
+		}
 	} else {
 		//queue_delayed_work(wq_vib, &work_viboff, 0);
 		queue_delayed_work(wq_vib, &work_vibon, 0);
@@ -283,21 +300,37 @@ void controlVibrator(unsigned int duration, unsigned int strength)
 
 static void enable_vibetonz_from_user(struct timed_output_dev *dev, int value)
 {
+	unsigned int strength = 0;
+	
 	printk(KERN_DEBUG "tspdrv: Enable time = %d msec\n", value);
-	hrtimer_cancel(&timer);
+	/*hrtimer_cancel(&timer);*/
 
 	/* set_vibetonz(value); */
-	vibrator_work = value;
-	schedule_work(&vibetonz_work);
+	/*vibrator_work = value;
+	schedule_work(&vibetonz_work);*/
 
 	if (value > 0 && (value != TEST_MODE_TIME)) {
 		if (value > max_timeout)
 			value = max_timeout;
+		
+		if (value == 25) {
+			
+			printk(KERN_DEBUG "tspdrv: overriding to duration: %d, strength: %d\n",
+				   sttg_tk_vib_duration, sttg_tk_vib_strength);
+			
+			if (sttg_tk_vib_strength)
+				strength = sttg_tk_vib_strength;
+			
+			if (sttg_tk_vib_duration)
+				value = sttg_tk_vib_duration;
+		}
 
-		hrtimer_start(&timer,
+		/*hrtimer_start(&timer,
 			ktime_set(value / 1000, (value % 1000) * 1000000),
 			HRTIMER_MODE_REL);
-		vibrator_value = 0;
+		vibrator_value = 0;*/
+		
+		controlVibrator(value, strength, 2);
 	}
 }
 
