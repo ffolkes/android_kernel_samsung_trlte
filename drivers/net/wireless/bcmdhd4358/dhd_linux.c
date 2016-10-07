@@ -343,7 +343,13 @@ argos_rps_ctrl argos_rps_ctrl_data;
 
 #endif /* ARGOS_RPS_CPU_CTL && ARGOS_CPU_SCHEDULER && CUSTOMER_HW4 */
 
+extern bool flg_power_softsuspended;
+struct net_device *plasma_dhd_dev;
+//dhd_info_t *plasma_dhd_info = NULL;
+//static int plasma_dhd_suspend_mode = -1;
 
+//static void plasma_dhd_suspend_work(struct work_struct * work_plasma_dhd_suspend);
+//static DECLARE_DELAYED_WORK(work_plasma_dhd_suspend, plasma_dhd_suspend_work);
 
 #ifdef DHD_DEBUG
 static void dhd_mem_dump(void *dhd_info, void *event_info, u8 event);
@@ -1445,7 +1451,7 @@ EXPORT_SYMBOL(wifi_pm);
 int dtim_awake = 0;
 module_param(dtim_awake, int, 0660);
 
-int dtim_suspended = 0;
+int dtim_suspended = 4;
 module_param(dtim_suspended, int, 0660);
 
 int wifi_pm_awake = PM_FAST;
@@ -1487,7 +1493,7 @@ int power_mode = PM_MAX;
 	if (!dhd)
 		return -ENODEV;
 
-	pr_info("[dhd] dhd_set_suspend\n");
+	pr_info("[dhd] dhd_set_suspend, value: %d\n", value);
 	DHD_TRACE(("%s: enter, value = %d in_suspend=%d\n",
 		__FUNCTION__, value, dhd->in_suspend));
 
@@ -1636,12 +1642,15 @@ static int dhd_suspend_resume_helper(struct dhd_info *dhd, int val, int force)
 {
 	dhd_pub_t *dhdp = &dhd->pub;
 	int ret = 0;
+	
+	if (flg_power_softsuspended && !val)
+		return 0;
 
 	DHD_OS_WAKE_LOCK(dhdp);
 	DHD_PERIM_LOCK(dhdp);
 
 	/* Set flag when early suspend was called */
-	pr_info("[dhd] dhd_suspend_resume_helper\n");
+	pr_info("[dhd] dhd_suspend_resume_helper, value: %d, force: %d\n", val, force);
 	dhdp->in_suspend = val;
 	if ((force || !dhdp->suspend_disable_flag) &&
 		dhd_support_sta_mode(dhdp))
@@ -4519,6 +4528,9 @@ int dhd_do_driver_init(struct net_device *net)
 
 	/*  && defined(OEM_ANDROID) && defined(BCMSDIO) */
 	dhd = DHD_DEV_INFO(net);
+	
+	//pr_info("[dhd/plasma_dhd_suspend_work] dhd_do_driver_init\n");
+	//plasma_dhd_dev = net;
 
 	/* If driver is already initialized, do nothing
 	 */
@@ -8162,6 +8174,11 @@ int net_os_set_suspend(struct net_device *dev, int val, int force)
 {
 	int ret = 0;
 	dhd_info_t *dhd = DHD_DEV_INFO(dev);
+	
+	pr_info("[dhd] net_os_set_suspend, val: %i, force: %d\n", val, force);
+	
+	if (plasma_dhd_dev == NULL)
+		plasma_dhd_dev = dev;
 
 	if (dhd) {
 #if defined(CONFIG_HAS_EARLYSUSPEND) && defined(DHD_USE_EARLYSUSPEND)
@@ -8175,6 +8192,45 @@ int net_os_set_suspend(struct net_device *dev, int val, int force)
 	}
 	return ret;
 }
+	
+void plasma_dhd_suspend(int mode)
+{
+	dhd_info_t *dhd = DHD_DEV_INFO(plasma_dhd_dev);
+	
+	pr_info("[dhd/plasma_dhd_suspend] starting, mode: %i\n", mode);
+	
+	if (dhd) {
+		if (mode > 0)
+			dhd_suspend_resume_helper(dhd, 1, 0);
+		else
+			dhd_suspend_resume_helper(dhd, 0, 0);
+	}
+	
+	/*if (mode > 0)
+		plasma_dhd_suspend_mode = 1;
+	else
+		plasma_dhd_suspend_mode = 0;
+	
+	schedule_delayed_work(&work_plasma_dhd_suspend, 0);*/
+}
+	
+/*static void plasma_dhd_suspend_work(struct work_struct * work_plasma_dhd_suspend)
+{
+	dhd_info_t *dhd = DHD_DEV_INFO(plasma_dhd_dev);
+	
+	pr_info("[dhd/plasma_dhd_suspend_work] starting, mode: %i\n", plasma_dhd_suspend_mode);
+	
+	if (dhd) {
+		if (plasma_dhd_suspend_mode < 0)
+			pr_info("[dhd/plasma_dhd_suspend_work] failed, mode was not primed\n");
+		else if (plasma_dhd_suspend_mode > 0)
+			dhd_suspend_resume_helper(dhd, 1, 0);
+		else
+			dhd_suspend_resume_helper(dhd, 0, 0);
+	}
+	
+	plasma_dhd_suspend_mode = -1;
+}*/
 
 int net_os_set_suspend_bcn_li_dtim(struct net_device *dev, int val)
 {
