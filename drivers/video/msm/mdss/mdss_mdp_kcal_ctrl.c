@@ -20,19 +20,29 @@
 #include <linux/platform_device.h>
 #include <linux/init.h>
 #include <linux/module.h>
-
-#if defined(CONFIG_MMI_PANEL_NOTIFICATIONS) && defined(CONFIG_FB)
-#include <mach/mmi_panel_notifier.h>
-#include <linux/notifier.h>
-#include <linux/fb.h>
-#elif defined(CONFIG_FB)
-#include <linux/notifier.h>
-#include <linux/fb.h>
-#endif
+#include <linux/delay.h>
 
 #include "mdss_mdp.h"
 
 #ifdef CONFIG_PLASMA
+extern void zzmoove_boost(int screen_state,
+						  int max_cycles, int mid_cycles, int allcores_cycles,
+						  int input_cycles, int devfreq_max_cycles, int devfreq_mid_cycles,
+						  int userspace_cycles);
+extern unsigned int sttg_pf_fi_steps;
+extern unsigned int sttg_pf_fi_stepdelay;
+extern unsigned int sttg_pf_fi_start_offset;
+extern bool sttg_pf_fi_uselightsensor;
+extern unsigned int sttg_pf_fi_midpoint;
+extern unsigned int sttg_pf_fi_midpoint_stepdelay;
+extern bool sttg_pf_fi_usesaturation;
+extern unsigned int sttg_pf_fo_steps;
+extern unsigned int sttg_pf_fo_stepdelay;
+extern unsigned int sttg_pf_fo_midpoint;
+extern unsigned int sttg_pf_fo_midpoint_stepdelay;
+extern bool flg_power_suspended;
+extern unsigned int plasma_sensor_rgblight_data_l;
+extern bool flg_power_softsuspended;
 static struct kcal_lut_data *dev_lut_data;
 static bool kcal_graymode_togglestate = false;
 static bool kcal_nightmode_togglestate = false;
@@ -42,6 +52,31 @@ static int kcal_g_saved = 0;
 static int kcal_b_saved = 0;
 static bool kcal_enable_saved = false;
 static int kcal_sat_saved = 0;
+static int kcal_min_saved = 0;
+static int kcal_nightmode_r = 160;
+static int kcal_nightmode_g = 40;
+static int kcal_nightmode_b = 40;
+unsigned int kcal_commit_wait = 2;
+static int ctr_commits = 0;
+bool flg_kcal_needs_write = false;
+static bool flg_kcal_fadingin = false;
+static bool flg_kcal_watchdogbarking = false;
+
+static void kcal_watchdog_work(struct work_struct * work_kcal_watchdog);
+static DECLARE_DELAYED_WORK(work_kcal_watchdog, kcal_watchdog_work);
+
+static struct workqueue_struct *wq_kcal;
+static struct workqueue_struct *wq_kcal_commit;
+struct work_struct work_kcal_commit;
+struct work_struct work_kcal_fadein;
+struct work_struct work_kcal_fadeout;
+
+wait_queue_head_t waitq_kcal_commit;
+
+struct mdss_data_type *mdata_ff;
+
+static DEFINE_MUTEX(lock_kcal_commit);
+
 #endif
 
 #define DEF_PCC 0x100
@@ -49,13 +84,6 @@ static int kcal_sat_saved = 0;
 #define PCC_ADJ 0x80
 
 struct kcal_lut_data {
-#if defined(CONFIG_MMI_PANEL_NOTIFICATIONS) && defined(CONFIG_FB)
-	struct mmi_notifier panel_nb;
-#elif defined(CONFIG_FB)
-	struct device dev;
-	struct notifier_block panel_nb;
-#endif
-	bool queue_changes;
 	int red;
 	int green;
 	int blue;
@@ -160,37 +188,165 @@ static uint32_t igc_rgb[IGC_LUT_ENTRIES] = {
 	48, 32, 16, 0
 };
 
-static bool mdss_mdp_kcal_is_panel_on(void)
+static void kcal_commit(void)
 {
-	int i;
 	struct mdss_mdp_ctl *ctl;
-	struct mdss_data_type *mdata = mdss_mdp_get_mdata();
+	
+	//pr_info("[kcal/kcal_commit] getting lock\n");
+	
+	if (mutex_trylock(&lock_kcal_commit)) {
+		
+		if (kcal_commit_wait < 100 && !flg_kcal_needs_write) {
+			//pr_info("[kcal/kcal_commit] commit not needed\n");
+			mutex_unlock(&lock_kcal_commit);
+			return;
+		} else {
+			//pr_info("[kcal/kcal_commit] commit needed\n");
+		}
+		
+		ctl = mdata_ff->ctl_off;
+		
+		/*if (flg_kcal_watchdogbarking) {
+			pr_info("[kcal/kcal_commit] watchdog barking, aborting\n");
+			mutex_unlock(&lock_kcal_commit);
+			return;
+		}
+		
+		pr_info("[kcal/kcal_commit] waiting!\n");
+		
+		mdss_mdp_display_wait4comp(ctl);*/
+		
+		if (flg_kcal_watchdogbarking) {
+			pr_info("[kcal/kcal_commit] watchdog barking, aborting\n");
+			mutex_unlock(&lock_kcal_commit);
+			return;
+		}
+		
+		//pr_info("[kcal/kcal_commit] committing!\n");
+		mdss_mdp_display_commit(ctl, NULL, NULL);
+		
+		//pr_info("[kcal/kcal_commit] committed\n");
+		mdss_mdp_display_wait4comp(ctl);
+		
+		//pr_info("[kcal/kcal_commit] wait complete\n");
+		
+		mutex_unlock(&lock_kcal_commit);
+		//pr_info("[kcal/kcal_commit_work] unlocked\n");
+		
+	} else {
+		pr_info("[kcal/kcal_commit_work] lock failed\n");
+	}
+}
 
-	for (i = 0; i < mdata->nctl; i++) {
-		ctl = mdata->ctl_off + i;
-		if (mdss_mdp_ctl_is_power_on(ctl))
-			return true;
+static void kcal_commit_work(struct work_struct * work)
+{
+	kcal_commit();
+}
+
+static int mdss_mdp_kcal_display_commit(void)
+{
+	int ret = 0;
+	struct mdss_mdp_ctl *ctl;
+	//struct mdss_data_type *mdata = mdss_mdp_get_mdata();
+	
+	//pr_info("[kcal/mdss_mdp_kcal_display_commit] starting\n");
+	
+	// for some reason it crashes immediately upon starting to boot,
+	// so be lazy and just block it once.
+	if (ctr_commits < 5) {
+		ctr_commits++;
+		return 1;
+	}
+	
+	if (flg_kcal_watchdogbarking)
+		return 1;
+	
+	if (kcal_commit_wait) {
+		if (kcal_commit_wait >= 100) {
+			//pr_info("[kcal/mdss_mdp_kcal_display_commit] wait_event\n");
+			ret = wait_event_interruptible_timeout(waitq_kcal_commit, !flg_kcal_needs_write, msecs_to_jiffies(kcal_commit_wait - 100));
+			
+			flg_kcal_needs_write = false;
+			
+			if (!ret) {
+				//pr_info("[kcal/mdss_mdp_kcal_display_commit] wait_event timed out\n");
+			} else {
+				//pr_info("[kcal/mdss_mdp_kcal_display_commit] wait_event stopped early, ret: %d\n", ret);
+				return 1;
+			}
+		} else {
+			//pr_info("[kcal/mdss_mdp_kcal_display_commit] waiting %d ms\n", kcal_commit_wait);
+			usleep_range(kcal_commit_wait * 1000, kcal_commit_wait * 1000);
+			
+			if (!flg_kcal_needs_write) {
+				//pr_info("[kcal/mdss_mdp_kcal_display_commit] commit not needed\n");
+				return ret;
+			} else {
+				//pr_info("[kcal/mdss_mdp_kcal_display_commit] commit needed\n");
+			}
+		}
+	}
+	
+	ctl = mdata_ff->ctl_off;
+	
+	/* commit/pp setup requires mfd */
+	if ((mdss_mdp_ctl_is_power_on(ctl)) && (ctl->mfd) && !flg_kcal_watchdogbarking) {
+#if defined(CONFIG_FB_MSM_MDSS_SAMSUNG)
+		//if (!work_busy(&work_kcal_commit)
+		//	&& !mutex_is_locked(&lock_kcal_commit)) {
+			//pr_info("[kcal/mdss_mdp_kcal_display_commit] doing commit %d\n", ctr_commits);
+			//queue_work_on(0, wq_kcal_commit, &work_kcal_commit);
+			kcal_commit();
+		//} else {
+		//	pr_info("[kcal/mdss_mdp_kcal_display_commit] already locked or work busy! commit %d skipped\n", ctr_commits);
+		//}
+#else
+		ret = mdss_mdp_pp_setup(ctl);
+#endif
+		if (ret)
+			pr_err("%s: commit failed: %d\n", __func__, ret);
+	} else {
+		pr_info("[kcal/mdss_mdp_kcal_display_commit] skipped because panel isn't on: %d or watchdog barking\n",
+				mdss_mdp_ctl_is_power_on(ctl));
+		return 3;
 	}
 
-	return false;
+	return ret;
 }
 
 static void mdss_mdp_kcal_update_pcc(struct kcal_lut_data *lut_data)
 {
 	u32 copyback = 0;
 	struct mdp_pcc_cfg_data pcc_config;
-
+	
 	memset(&pcc_config, 0, sizeof(struct mdp_pcc_cfg_data));
-
+	
+	// don't validate min if we're in a plasma mode.
+	if (lut_data->minimum > 0
+		&& !kcal_blackout_togglestate
+		&& !kcal_nightmode_togglestate
+		&& !kcal_graymode_togglestate) {
+		
+		lut_data->red = lut_data->red < lut_data->minimum ?
+		lut_data->minimum : lut_data->red;
+		lut_data->green = lut_data->green < lut_data->minimum ?
+		lut_data->minimum : lut_data->green;
+		lut_data->blue = lut_data->blue < lut_data->minimum ?
+		lut_data->minimum : lut_data->blue;
+	}
+	
 	pcc_config.block = MDP_LOGICAL_BLOCK_DISP_0;
 	pcc_config.ops = lut_data->enable ?
-		MDP_PP_OPS_WRITE | MDP_PP_OPS_ENABLE :
-			MDP_PP_OPS_WRITE | MDP_PP_OPS_DISABLE;
+	MDP_PP_OPS_WRITE | MDP_PP_OPS_ENABLE :
+	MDP_PP_OPS_WRITE | MDP_PP_OPS_DISABLE;
 	pcc_config.r.r = lut_data->red * PCC_ADJ;
 	pcc_config.g.g = lut_data->green * PCC_ADJ;
 	pcc_config.b.b = lut_data->blue * PCC_ADJ;
-
+	
 	mdss_mdp_pcc_config(&pcc_config, &copyback);
+	
+	if (!work_busy(&work_kcal_commit))
+		flg_kcal_needs_write = true;
 }
 
 #ifndef CONFIG_PLASMA
@@ -260,6 +416,9 @@ static void mdss_mdp_kcal_update_pa(struct kcal_lut_data *lut_data)
 
 		mdss_mdp_pa_v2_config(&pa_v2_config, &copyback);
 	}
+	
+	if (!work_busy(&work_kcal_commit))
+		flg_kcal_needs_write = true;
 }
 
 static void mdss_mdp_kcal_update_igc(struct kcal_lut_data *lut_data)
@@ -278,35 +437,475 @@ static void mdss_mdp_kcal_update_igc(struct kcal_lut_data *lut_data)
 	igc_config.c2_data = igc_rgb;
 
 	mdss_mdp_igc_lut_config(&igc_config, &copyback, copy_from_kernel);
-}
-
-static void mdss_mdp_kcal_check_pcc(struct kcal_lut_data *lut_data)
-{
-	lut_data->red = lut_data->red < lut_data->minimum ?
-		lut_data->minimum : lut_data->red;
-	lut_data->green = lut_data->green < lut_data->minimum ?
-		lut_data->minimum : lut_data->green;
-	lut_data->blue = lut_data->blue < lut_data->minimum ?
-		lut_data->minimum : lut_data->blue;
+	
+	if (!work_busy(&work_kcal_commit))
+		flg_kcal_needs_write = true;
 }
 
 #ifdef CONFIG_PLASMA
-void kcal_restoreColors(void) {
+static void kcal_watchdog_work(struct work_struct * work_kcal_watchdog)
+{
+	struct mdss_mdp_ctl *ctl;
 	
-	pr_info("[kcal/kcal_unsetGraymode] restoring colors - current r: %d g: %d b: %d, saved r: %d g: %d b: %d\n",
-			dev_lut_data->red, dev_lut_data->green, dev_lut_data->blue,
-			kcal_r_saved, kcal_g_saved, kcal_b_saved);
+	pr_info("[kcal/kcal_watchdog_work] starting, making sure fade has completed...\n");
 	
-	// restore.
+	if (!flg_power_suspended && flg_kcal_fadingin) {
+		// we're still fading on, something must have gone wrong.
+		
+		pr_info("[kcal/kcal_watchdog_work] barking!\n");
+		
+		flg_kcal_fadingin = false;
+		flg_kcal_watchdogbarking = true;
+		//cancel_work_sync(&work_kcal_fadein);
+		
+		if (kcal_nightmode_togglestate) {
+			dev_lut_data->red = kcal_nightmode_r;
+			dev_lut_data->green = kcal_nightmode_g;
+			dev_lut_data->blue = kcal_nightmode_b;
+		} else {
+			dev_lut_data->red = kcal_r_saved;
+			dev_lut_data->green = kcal_g_saved;
+			dev_lut_data->blue = kcal_b_saved;
+		}
+		dev_lut_data->sat = kcal_sat_saved;
+		
+		ctl = mdata_ff->ctl_off;
+		
+		mdss_mdp_kcal_update_pcc(dev_lut_data);
+		mdss_mdp_kcal_update_pa(dev_lut_data);
+		
+		// check to make sure we haven't begun a new fadein event.
+		if (flg_kcal_fadingin || flg_power_suspended)
+			return;
+		
+		pr_info("[kcal/kcal_watchdog_work] committing 1/3\n");
+		mdss_mdp_display_commit(ctl, NULL, NULL);
+		
+		if (flg_kcal_fadingin || flg_power_suspended)
+			return;
+
+		msleep(1000);
+		pr_info("[kcal/kcal_watchdog_work] committing 2/3\n");
+		mdss_mdp_display_commit(ctl, NULL, NULL);
+		
+		if (flg_kcal_fadingin || flg_power_suspended)
+			return;
+		
+		msleep(1000);
+		pr_info("[kcal/kcal_watchdog_work] committing 3/3\n");
+		mdss_mdp_display_commit(ctl, NULL, NULL);
+	}
+	flg_kcal_watchdogbarking = false;
+}
+
+static void kcal_fadein_work(struct work_struct * work)
+{
+	int each = 0;
+	int each_sat = 0;
+	int i;
+	int r_new = 0;
+	int g_new = 0;
+	int b_new = 0;
+	int sat_new = 0;
+	
+	pr_info("[kcal/kcal_fadein_work] starting, offset: %d\n", sttg_pf_fi_start_offset);
+	
+	if (!sttg_pf_fi_steps
+		|| flg_power_softsuspended
+		|| kcal_blackout_togglestate
+//		|| kcal_nightmode_togglestate
+		|| kcal_graymode_togglestate)
+		return;
+	
+	// force kcal on.
+	if (!dev_lut_data->enable)
+		dev_lut_data->enable = true;
+	
+	// schedule work in 1500ms to make sure the fade completed.
+	pr_info("[kcal/kcal_fadein_work] scheduling watchdog...\n");
+	flg_kcal_fadingin = true;
+	cancel_delayed_work(&work_kcal_watchdog);
+	schedule_delayed_work_on(0, &work_kcal_watchdog, msecs_to_jiffies(1000));
+	
+	// if we're not blackedout, do so now.
+	if ((sttg_pf_fi_start_offset  // if we're using an offset, always make the colors match
+		 && (dev_lut_data->red != sttg_pf_fi_start_offset
+			 || dev_lut_data->green != sttg_pf_fi_start_offset
+			 || dev_lut_data->blue != sttg_pf_fi_start_offset)
+		 )
+		|| (!sttg_pf_fi_start_offset  // or if we're not using an offset, just make sure they're zero
+			&& (dev_lut_data->red > sttg_pf_fi_start_offset
+				|| dev_lut_data->green > sttg_pf_fi_start_offset
+				|| dev_lut_data->blue > sttg_pf_fi_start_offset)
+			)
+		) {
+		
+		pr_info("[kcal/kcal_fadein_work] blacking out\n");
+		
+		// blackout.
+		dev_lut_data->red = sttg_pf_fi_start_offset;
+		dev_lut_data->green = sttg_pf_fi_start_offset;
+		dev_lut_data->blue = sttg_pf_fi_start_offset;
+		if (sttg_pf_fi_usesaturation)
+			dev_lut_data->sat = 224;
+		
+		// apply the blackout.
+		mdss_mdp_kcal_update_pcc(dev_lut_data);
+		if (sttg_pf_fi_usesaturation)
+			mdss_mdp_kcal_update_pa(dev_lut_data);
+		mdss_mdp_kcal_display_commit();
+	}
+	
+	each = 256 / sttg_pf_fi_steps;
+	each_sat = (kcal_sat_saved - 224) / sttg_pf_fi_steps;
+	
+	if (!flg_kcal_fadingin) {
+		pr_info("[kcal/kcal_fadein_work] aborting\n");
+		return;
+	}
+	
+	// if we're turning nightmode on while the screen is on, start partially on,
+	// because the first few steps will be too dark to notice.
+	if (kcal_nightmode_togglestate
+		&& !flg_power_suspended) {
+		
+		dev_lut_data->red = min(50, kcal_nightmode_r);
+		dev_lut_data->green = min(30, kcal_nightmode_g);
+		dev_lut_data->blue = min(30, kcal_nightmode_b);
+	}
+	
+	pr_info("[kcal/kcal_fadein_work] steps: %d, each: %d, delay: %d, light: %d\n",
+			sttg_pf_fi_steps, each, sttg_pf_fi_stepdelay, plasma_sensor_rgblight_data_l);
+	
+	if (sttg_pf_fi_uselightsensor && plasma_sensor_rgblight_data_l > 50) {
+		dev_lut_data->red = min(100, (int) (dev_lut_data->red + ((plasma_sensor_rgblight_data_l / 10) / 2)));
+		dev_lut_data->green = min(100, (int) (dev_lut_data->green + ((plasma_sensor_rgblight_data_l / 10) / 2)));
+		dev_lut_data->blue = min(100, (int) (dev_lut_data->blue + ((plasma_sensor_rgblight_data_l / 10) / 2)));
+	}
+	
+	for (i = 0; i < sttg_pf_fi_steps; i++) {
+		
+		pr_info("[kcal/kcal_fadein_work] was r: %d, g: %d, b: %d\n",
+				dev_lut_data->red, dev_lut_data->green, dev_lut_data->blue);
+		
+		if (!flg_kcal_fadingin) {
+			pr_info("[kcal/kcal_fadein_work] aborting\n");
+			return;
+		}
+		
+		r_new = dev_lut_data->red + each;
+		g_new = dev_lut_data->green + each;
+		b_new = dev_lut_data->blue + each;
+		sat_new = dev_lut_data->sat + each_sat;
+		
+		if (kcal_nightmode_togglestate) {
+			
+			if (r_new > kcal_nightmode_r)
+				r_new = kcal_nightmode_r;
+			
+			if (g_new > kcal_nightmode_g)
+				g_new = kcal_nightmode_g;
+			
+			if (b_new > kcal_nightmode_b)
+				b_new = kcal_nightmode_b;
+			
+		} else {
+			
+			if (r_new > kcal_r_saved)
+				r_new = kcal_r_saved;
+			
+			if (g_new > kcal_g_saved)
+				g_new = kcal_g_saved;
+			
+			if (b_new > kcal_b_saved)
+				b_new = kcal_b_saved;
+		}
+		
+		if (sat_new > kcal_sat_saved)
+			sat_new = kcal_sat_saved;
+		
+		dev_lut_data->red = r_new;
+		dev_lut_data->green = g_new;
+		dev_lut_data->blue = b_new;
+		if (sttg_pf_fi_usesaturation)
+			dev_lut_data->sat = sat_new;
+		
+		//pr_info("[kcal/kcal_fadein_work] now r: %d, g: %d, b: %d\n",
+		//		dev_lut_data->red, dev_lut_data->green, dev_lut_data->blue);
+		
+		mdss_mdp_kcal_update_pcc(dev_lut_data);
+		if (sttg_pf_fi_usesaturation)
+			mdss_mdp_kcal_update_pa(dev_lut_data);
+		mdss_mdp_kcal_display_commit();
+		
+		if (i >= sttg_pf_fi_midpoint)
+			usleep_range(sttg_pf_fi_midpoint_stepdelay * 1000, sttg_pf_fi_midpoint_stepdelay * 1000);
+		else
+			usleep_range(sttg_pf_fi_stepdelay * 1000, sttg_pf_fi_stepdelay * 1000);
+		
+		if ((kcal_nightmode_togglestate
+			 && dev_lut_data->red == kcal_nightmode_r
+			 && dev_lut_data->green == kcal_nightmode_g
+			 && dev_lut_data->blue == kcal_nightmode_b)
+			|| (dev_lut_data->red == kcal_r_saved
+				&& dev_lut_data->green == kcal_g_saved
+				&& dev_lut_data->blue == kcal_b_saved))
+			break;
+		
+		if (!flg_kcal_fadingin) {
+			pr_info("[kcal/kcal_fadein_work] aborting\n");
+			return;
+		}
+	}
+	
+	if (!flg_kcal_fadingin) {
+		pr_info("[kcal/kcal_fadein_work] aborting\n");
+		return;
+	}
+	
+	// make sure saturation is at user-defined full.
+	if (dev_lut_data->sat < kcal_sat_saved) {
+		dev_lut_data->sat = kcal_sat_saved;
+		mdss_mdp_kcal_update_pa(dev_lut_data);
+		mdss_mdp_kcal_display_commit();
+	}
+	
+	// turn kcal off if it was before.
+	if (!kcal_enable_saved)
+		dev_lut_data->enable = false;
+	
+	flg_kcal_fadingin = false;
+	
+	pr_info("[kcal/kcal_fadein_work] done\n");
+}
+
+void kcal_fadeIn(void) {
+	
+	pr_info("[kcal/kcal_fadeIn] scheduling work\n");
+	
+	// mode/max/mid/allcores/input/gpumax/gpumid/user
+	zzmoove_boost(0, 0, 0, 0, 0, 20, 20, 20);
+	
+	if (!work_busy(&work_kcal_fadein)/* && !work_busy(&work_kcal_fadeout)*/)
+		queue_work_on(0, wq_kcal, &work_kcal_fadein);
+	else
+		pr_info("[kcal/kcal_fadeIn] not scheduling, already executing work\n");
+	
+	/*(if (!delayed_work_pending(&work_pf_fadein)
+		&& !cancel_delayed_work_sync(&work_pf_fadein))
+		schedule_delayed_work_on(0, &work_pf_fadein, 0);
+	else
+		pr_info("[kcal_fadeIn] not scheduling, already executing work\n");*/
+	
+}
+
+static void kcal_fadeout_work(struct work_struct * work)
+{
+	int each = 0;
+	int i;
+	int r_new = 0;
+	int g_new = 0;
+	int b_new = 0;
+	int ret = 0;
+	
+	pr_info("[kcal/kcal_fadeout_work] starting\n");
+	
+	if (!sttg_pf_fo_steps
+		|| kcal_blackout_togglestate
+//		|| kcal_nightmode_togglestate
+		|| kcal_graymode_togglestate
+		|| work_busy(&work_kcal_fadein))
+		return;
+	
+	// force kcal on.
+	if (!dev_lut_data->enable)
+		dev_lut_data->enable = true;
+	
+	// if we're not restored, do so now.
+	if (kcal_nightmode_togglestate
+		&& (dev_lut_data->red != kcal_nightmode_r
+			|| dev_lut_data->green != kcal_nightmode_g
+			|| dev_lut_data->blue != kcal_nightmode_b)
+		) {
+		
+		// restore nightmode.
+		dev_lut_data->red = kcal_nightmode_r;
+		dev_lut_data->green = kcal_nightmode_g;
+		dev_lut_data->blue = kcal_nightmode_b;
+		
+	} else if (dev_lut_data->red != kcal_r_saved
+		|| dev_lut_data->green != kcal_g_saved
+		|| dev_lut_data->blue != kcal_b_saved) {
+		
+		// restore.
+		dev_lut_data->red = kcal_r_saved;
+		dev_lut_data->green = kcal_g_saved;
+		dev_lut_data->blue = kcal_b_saved;
+		
+		// apply the restore.
+		mdss_mdp_kcal_update_pcc(dev_lut_data);
+		mdss_mdp_kcal_display_commit();
+	}
+	
+	each = 256 / sttg_pf_fo_steps;
+	
+	pr_info("[kcal/kcal_fadeout_work] steps: %d, each: %d, delay: %d\n", sttg_pf_fo_steps, each, sttg_pf_fo_stepdelay);
+	
+	dev_lut_data->minimum = 0;
+	
+	for (i = 0; i < sttg_pf_fo_steps; i++) {
+		
+		pr_info("[kcal/kcal_fadeout_work] was r: %d, g: %d, b: %d\n",
+				dev_lut_data->red, dev_lut_data->green, dev_lut_data->blue);
+		
+		if (work_busy(&work_kcal_fadein)){
+			pr_info("[kcal/kcal_fadeout_work] fadein work started! aborting...\n");
+			return;
+		}
+		
+		r_new = dev_lut_data->red - each;
+		g_new = dev_lut_data->green - each;
+		b_new = dev_lut_data->blue - each;
+		
+		if (r_new < 0)
+			r_new = 0;
+		
+		if (g_new < 0)
+			g_new = 0;
+		
+		if (b_new < 0)
+			b_new = 0;
+		
+		dev_lut_data->red = r_new;
+		dev_lut_data->green = g_new;
+		dev_lut_data->blue = b_new;
+		
+		//pr_info("[kcal/kcal_fadeout_work] now r: %d, g: %d, b: %d\n",
+		//		dev_lut_data->red, dev_lut_data->green, dev_lut_data->blue);
+		
+		mdss_mdp_kcal_update_pcc(dev_lut_data);
+		ret = mdss_mdp_kcal_display_commit();
+		
+		if (ret == 3) {
+			pr_info("[kcal/kcal_fadeout_work] panel has turned off. restoring colors and aborting...\n");
+			break;
+		}
+		
+		if (i >= sttg_pf_fo_midpoint)
+			usleep_range(sttg_pf_fo_midpoint_stepdelay * 1000, sttg_pf_fo_midpoint_stepdelay * 1000);
+		else
+			usleep_range(sttg_pf_fo_stepdelay * 1000, sttg_pf_fo_stepdelay * 1000);
+		
+		if (dev_lut_data->red <= 0
+			&& dev_lut_data->green <= 0
+			&& dev_lut_data->blue <= 0)
+			break;
+	}
+	
+	// give us some time to get closer to suspend,
+	// otherwise full colors might flash on for a few ms.
+	if (ret != 3)
+		msleep(150);
+	
+	// restore the min.
+	dev_lut_data->minimum = kcal_min_saved;
+	
+	// restore the colors, otherwise we'll be greeted with black
+	// when we turn it on.
 	dev_lut_data->red = kcal_r_saved;
 	dev_lut_data->green = kcal_g_saved;
 	dev_lut_data->blue = kcal_b_saved;
 	
-	mdss_mdp_kcal_check_pcc(dev_lut_data);
-	if (mdss_mdp_kcal_is_panel_on())
-		mdss_mdp_kcal_update_pcc(dev_lut_data);
+	//mdss_mdp_kcal_update_pcc(dev_lut_data);
+	//mdss_mdp_kcal_display_commit();
+	
+	// turn kcal off if it was before.
+	if (!kcal_enable_saved)
+		dev_lut_data->enable = false;
+	
+	pr_info("[kcal/kcal_fadeout_work] done\n");
+}
+
+void kcal_fadeOut(void) {
+	
+	// mode/max/mid/allcores/input/gpumax/gpumid/user
+	zzmoove_boost(0, 0, 0, 0, 0, 20, 20, 20);
+	
+	pr_info("[kcal/kcal_fadeOut] scheduling work\n");
+	if (!work_busy(&work_kcal_fadein) && !work_busy(&work_kcal_fadeout))
+		queue_work_on(0, wq_kcal, &work_kcal_fadeout);
 	else
-		dev_lut_data->queue_changes = true;
+		pr_info("[kcal/kcal_fadeOut] not scheduling, already executing work\n");
+	
+}
+
+void kcal_restoreColors(void) {
+	
+	pr_info("[kcal/kcal_restoreColors] restoring colors - current r: %d g: %d b: %d, saved r: %d g: %d b: %d\n",
+			dev_lut_data->red, dev_lut_data->green, dev_lut_data->blue,
+			kcal_r_saved, kcal_g_saved, kcal_b_saved);
+	
+	// turn kcal on if it isn't already.
+	if (!dev_lut_data->enable)
+		dev_lut_data->enable = true;
+	
+	// do we really need to update?
+	if (dev_lut_data->red == kcal_r_saved
+		&& dev_lut_data->green == kcal_g_saved
+		&& dev_lut_data->blue == kcal_b_saved)
+		return;
+	
+	// restore.
+	if (sttg_pf_fi_steps && !flg_power_suspended) {
+		// use the fade, but only if the panel is already on when it is called.
+		kcal_fadeIn();
+	} else {
+		dev_lut_data->red = kcal_r_saved;
+		dev_lut_data->green = kcal_g_saved;
+		dev_lut_data->blue = kcal_b_saved;
+		
+		mdss_mdp_kcal_update_pcc(dev_lut_data);
+		mdss_mdp_kcal_display_commit();
+		
+		// turn kcal off if it was before.
+		if (!kcal_enable_saved)
+			dev_lut_data->enable = false;
+	}
+}
+
+void kcal_ensureColors(void) {
+	// this function checks to make sure the colors are set to normal.
+	
+	pr_info("[kcal/kcal_ensureColors] current r: %d, g: %d, b: %d, saved r: %d, g: %d, b: %d\n",
+			dev_lut_data->red, dev_lut_data->green, dev_lut_data->blue,
+			kcal_r_saved, kcal_g_saved, kcal_b_saved);
+	
+	// turn kcal on if it isn't already.
+	if (!dev_lut_data->enable)
+		dev_lut_data->enable = true;
+	
+	if ((!kcal_nightmode_togglestate
+		 && (dev_lut_data->red != kcal_r_saved
+			 || dev_lut_data->green != kcal_g_saved
+			 || dev_lut_data->blue != kcal_b_saved))
+		|| (kcal_nightmode_togglestate
+			&& (dev_lut_data->red != kcal_nightmode_r
+				|| dev_lut_data->green != kcal_nightmode_g
+				|| dev_lut_data->blue != kcal_nightmode_b))) {
+		
+		pr_info("[kcal/kcal_ensureColors] colors are not normal! restoring now...\n");
+		
+		kcal_restoreColors();
+		
+	} else {
+		// if it says we're good, push out pcc changes and commit to be sure.
+		mdss_mdp_kcal_update_pcc(dev_lut_data);
+		mdss_mdp_kcal_display_commit();
+		
+		// turn kcal off if it was before.
+		if (!kcal_enable_saved)
+			dev_lut_data->enable = false;
+	}
 }
 
 void kcal_unsetGraymode(void) {
@@ -317,10 +916,8 @@ void kcal_unsetGraymode(void) {
 	// graymode.
 	dev_lut_data->sat = kcal_sat_saved;
 	
-	if (mdss_mdp_kcal_is_panel_on())
-		mdss_mdp_kcal_update_pa(dev_lut_data);
-	else
-		dev_lut_data->queue_changes = true;
+	mdss_mdp_kcal_update_pa(dev_lut_data);
+	mdss_mdp_kcal_display_commit();
 }
 
 void kcal_setGraymode(void) {
@@ -331,10 +928,8 @@ void kcal_setGraymode(void) {
 	// graymode.
 	dev_lut_data->sat = 128;
 	
-	if (mdss_mdp_kcal_is_panel_on())
-		mdss_mdp_kcal_update_pa(dev_lut_data);
-	else
-		dev_lut_data->queue_changes = true;
+	mdss_mdp_kcal_update_pa(dev_lut_data);
+	mdss_mdp_kcal_display_commit();
 }
 
 void kcal_setNightmode(void) {
@@ -344,14 +939,18 @@ void kcal_setNightmode(void) {
 			kcal_r_saved, kcal_g_saved, kcal_b_saved);
 	
 	// nightmode.
-	dev_lut_data->red = 128;
-	dev_lut_data->green = 0;
-	dev_lut_data->blue = 0;
+	dev_lut_data->red = kcal_nightmode_r;
+	dev_lut_data->green = kcal_nightmode_g;
+	dev_lut_data->blue = kcal_nightmode_b;
 	
-	if (mdss_mdp_kcal_is_panel_on())
+	// commit colors. fade or instant?
+	if (sttg_pf_fi_steps && !flg_power_suspended) {
+		// use the fade, but only if the panel is already on when it is called.
+		kcal_fadeIn();
+	} else {
 		mdss_mdp_kcal_update_pcc(dev_lut_data);
-	else
-		dev_lut_data->queue_changes = true;
+		mdss_mdp_kcal_display_commit();
+	}
 }
 
 void kcal_setBlackout(void) {
@@ -365,15 +964,13 @@ void kcal_setBlackout(void) {
 	dev_lut_data->green = 0;
 	dev_lut_data->blue = 0;
 	
-	if (mdss_mdp_kcal_is_panel_on())
-		mdss_mdp_kcal_update_pcc(dev_lut_data);
-	else
-		dev_lut_data->queue_changes = true;
+	mdss_mdp_kcal_update_pcc(dev_lut_data);
+	mdss_mdp_kcal_display_commit();
 }
 
 void kcal_toggle_graymode(void)
 {
-	pr_info("[kcal/kcal_toggle_nightmode] starting\n");
+	pr_info("[kcal/kcal_toggle_graymode] starting\n");
 	
 	if (!kcal_graymode_togglestate) {
 		// toggle on.
@@ -381,37 +978,35 @@ void kcal_toggle_graymode(void)
 		// force kcal on.
 		if (!dev_lut_data->enable) {
 			dev_lut_data->enable = true;
-			if (mdss_mdp_kcal_is_panel_on()) {
-				mdss_mdp_kcal_update_pcc(dev_lut_data);
-				mdss_mdp_kcal_update_pa(dev_lut_data);
-				mdss_mdp_kcal_update_igc(dev_lut_data);
-			} else
-				dev_lut_data->queue_changes = true;
+			//mdss_mdp_kcal_update_pcc(dev_lut_data);
+			//mdss_mdp_kcal_update_pa(dev_lut_data);
+			//mdss_mdp_kcal_update_igc(dev_lut_data);
+			//mdss_mdp_kcal_display_commit();
 		}
+		
+		// set this first so we know not to use the min.
+		kcal_graymode_togglestate = true;
 		
 		if (!kcal_blackout_togglestate) {
 			// only apply this if the blackout is off.
 			kcal_setGraymode();
 		}
 		
-		kcal_graymode_togglestate = true;
-		
 	} else if (!kcal_blackout_togglestate) {
 		// only restore if the blackout is off.
 		
-		kcal_unsetGraymode();
-		
+		// set this first so we know to use the min.
 		kcal_graymode_togglestate = false;
+		
+		kcal_unsetGraymode();
 		
 		// turn kcal off if it was before.
 		if (!kcal_enable_saved) {
 			dev_lut_data->enable = false;
-			if (mdss_mdp_kcal_is_panel_on()) {
-				mdss_mdp_kcal_update_pcc(dev_lut_data);
-				mdss_mdp_kcal_update_pa(dev_lut_data);
-				mdss_mdp_kcal_update_igc(dev_lut_data);
-			} else
-				dev_lut_data->queue_changes = true;
+			mdss_mdp_kcal_update_pcc(dev_lut_data);
+			mdss_mdp_kcal_update_pa(dev_lut_data);
+			mdss_mdp_kcal_update_igc(dev_lut_data);
+			mdss_mdp_kcal_display_commit();
 		}
 	}
 }
@@ -421,43 +1016,42 @@ void kcal_toggle_nightmode(void)
 {
 	pr_info("[kcal/kcal_toggle_nightmode] starting\n");
 	
-	if (!kcal_nightmode_togglestate) {
+	if (!kcal_nightmode_togglestate
+		&& kcal_nightmode_r) {
 		// toggle on.
 		
 		// force kcal on.
 		if (!dev_lut_data->enable) {
 			dev_lut_data->enable = true;
-			if (mdss_mdp_kcal_is_panel_on()) {
-				mdss_mdp_kcal_update_pcc(dev_lut_data);
-				mdss_mdp_kcal_update_pa(dev_lut_data);
-				mdss_mdp_kcal_update_igc(dev_lut_data);
-			} else
-				dev_lut_data->queue_changes = true;
+			//mdss_mdp_kcal_update_pcc(dev_lut_data);
+			//mdss_mdp_kcal_update_pa(dev_lut_data);
+			//mdss_mdp_kcal_update_igc(dev_lut_data);
+			//mdss_mdp_kcal_display_commit();
 		}
+		
+		// set this first so we know not to use the min.
+		kcal_nightmode_togglestate = true;
 		
 		if (!kcal_blackout_togglestate) {
 			// only apply this if the blackout is off.
 			kcal_setNightmode();
 		}
 		
-		kcal_nightmode_togglestate = true;
-		
 	} else if (!kcal_blackout_togglestate) {
 		// only restore if the blackout is off.
 		
-		kcal_restoreColors();
-		
+		// set this first so we know to use the min.
 		kcal_nightmode_togglestate = false;
+		
+		kcal_restoreColors();
 		
 		// turn kcal off if it was before.
 		if (!kcal_enable_saved) {
 			dev_lut_data->enable = false;
-			if (mdss_mdp_kcal_is_panel_on()) {
-				mdss_mdp_kcal_update_pcc(dev_lut_data);
-				mdss_mdp_kcal_update_pa(dev_lut_data);
-				mdss_mdp_kcal_update_igc(dev_lut_data);
-			} else
-				dev_lut_data->queue_changes = true;
+			mdss_mdp_kcal_update_pcc(dev_lut_data);
+			mdss_mdp_kcal_update_pa(dev_lut_data);
+			mdss_mdp_kcal_update_igc(dev_lut_data);
+			mdss_mdp_kcal_display_commit();
 		}
 	}
 }
@@ -465,7 +1059,7 @@ EXPORT_SYMBOL(kcal_toggle_nightmode);
 
 void kcal_toggle_blackout(unsigned int mode)
 {
-	pr_info("[kcal/kcal_toggle_blackout] start, mode: %d\n", mode);
+	pr_info("[kcal/kcal_toggle_blackout] starting, mode: %d\n", mode);
 	
 	if ((!kcal_blackout_togglestate || mode == 1) && mode != 2) {
 		// toggle on normally, or if forcing on, but don't fire if we're forcing off (2).
@@ -475,23 +1069,25 @@ void kcal_toggle_blackout(unsigned int mode)
 		// force kcal on.
 		if (!dev_lut_data->enable) {
 			dev_lut_data->enable = true;
-			if (mdss_mdp_kcal_is_panel_on()) {
-				mdss_mdp_kcal_update_pcc(dev_lut_data);
-				mdss_mdp_kcal_update_pa(dev_lut_data);
-				mdss_mdp_kcal_update_igc(dev_lut_data);
-			} else
-				dev_lut_data->queue_changes = true;
+			//mdss_mdp_kcal_update_pcc(dev_lut_data);
+			//mdss_mdp_kcal_update_pa(dev_lut_data);
+			//mdss_mdp_kcal_update_igc(dev_lut_data);
+			//mdss_mdp_kcal_display_commit();
 		}
+		
+		// set this first so we know not to use the min.
+		kcal_blackout_togglestate = true;
 		
 		// blackout RGB.
 		kcal_setBlackout();
-		
-		kcal_blackout_togglestate = true;
 		
 	} else {
 		// toggle off.
 		
 		pr_info("[kcal/kcal_toggle_blackout] turning off. kcal_blackout_togglestate: %d\n", kcal_blackout_togglestate);
+		
+		// set this first so we know to use the min.
+		kcal_blackout_togglestate = false;
 		
 		if (kcal_nightmode_togglestate) {
 			// nightmode was on, so put it back on.
@@ -501,17 +1097,13 @@ void kcal_toggle_blackout(unsigned int mode)
 			kcal_restoreColors();
 		}
 		
-		kcal_blackout_togglestate = false;
-		
 		// turn kcal off if it was before.
 		if (!kcal_enable_saved) {
 			dev_lut_data->enable = false;
-			if (mdss_mdp_kcal_is_panel_on()) {
-				mdss_mdp_kcal_update_pcc(dev_lut_data);
-				mdss_mdp_kcal_update_pa(dev_lut_data);
-				mdss_mdp_kcal_update_igc(dev_lut_data);
-			} else
-				dev_lut_data->queue_changes = true;
+			mdss_mdp_kcal_update_pcc(dev_lut_data);
+			mdss_mdp_kcal_update_pa(dev_lut_data);
+			mdss_mdp_kcal_update_igc(dev_lut_data);
+			mdss_mdp_kcal_display_commit();
 		}
 	}
 }
@@ -525,8 +1117,8 @@ static ssize_t kcal_store(struct device *dev, struct device_attribute *attr,
 	struct kcal_lut_data *lut_data = dev_get_drvdata(dev);
 
 	r = sscanf(buf, "%d %d %d", &kcal_r, &kcal_g, &kcal_b);
-	if ((r != 3) || (kcal_r < 1 || kcal_r > 256) ||
-		(kcal_g < 1 || kcal_g > 256) || (kcal_b < 1 || kcal_b > 256))
+	if ((r != 3) || (kcal_r < 0 || kcal_r > 256) ||
+		(kcal_g < 0 || kcal_g > 256) || (kcal_b < 0 || kcal_b > 256))
 		return -EINVAL;
 
 #ifdef CONFIG_PLASMA
@@ -547,12 +1139,8 @@ static ssize_t kcal_store(struct device *dev, struct device_attribute *attr,
 	lut_data->blue = kcal_b;
 #endif
 
-	mdss_mdp_kcal_check_pcc(lut_data);
-
-	if (mdss_mdp_kcal_is_panel_on())
-		mdss_mdp_kcal_update_pcc(lut_data);
-	else
-		lut_data->queue_changes = true;
+	mdss_mdp_kcal_update_pcc(lut_data);
+	mdss_mdp_kcal_display_commit();
 
 	return count;
 }
@@ -566,8 +1154,7 @@ static ssize_t kcal_show(struct device *dev, struct device_attribute *attr,
 #else
 	struct kcal_lut_data *lut_data = dev_get_drvdata(dev);
 	
-	if (mdss_mdp_kcal_is_panel_on() && lut_data->enable)
-		mdss_mdp_kcal_read_pcc(lut_data);
+	mdss_mdp_kcal_read_pcc(lut_data);
 
 	return scnprintf(buf, PAGE_SIZE, "%d %d %d\n",
 		lut_data->red, lut_data->green, lut_data->blue);
@@ -581,17 +1168,21 @@ static ssize_t kcal_min_store(struct device *dev,
 	struct kcal_lut_data *lut_data = dev_get_drvdata(dev);
 
 	r = kstrtoint(buf, 10, &kcal_min);
-	if ((r) || (kcal_min < 1 || kcal_min > 256))
+	if ((r) || (kcal_min < 0 || kcal_min > 256))
 		return -EINVAL;
+	
+#ifdef CONFIG_PLASMA
+	kcal_min_saved = kcal_min;
+	
+	if (kcal_blackout_togglestate) {
+		return count;
+	}
+#endif
 	
 	lut_data->minimum = kcal_min;
 
-	mdss_mdp_kcal_check_pcc(lut_data);
-
-	if (mdss_mdp_kcal_is_panel_on())
-		mdss_mdp_kcal_update_pcc(lut_data);
-	else
-		lut_data->queue_changes = true;
+	mdss_mdp_kcal_update_pcc(lut_data);
+	mdss_mdp_kcal_display_commit();
 
 	return count;
 }
@@ -599,9 +1190,14 @@ static ssize_t kcal_min_store(struct device *dev,
 static ssize_t kcal_min_show(struct device *dev,
 		struct device_attribute *attr, char *buf)
 {
+#ifdef CONFIG_PLASMA
+	return scnprintf(buf, PAGE_SIZE, "%d\n",
+					 kcal_min_saved);
+#else
 	struct kcal_lut_data *lut_data = dev_get_drvdata(dev);
 
 	return scnprintf(buf, PAGE_SIZE, "%d\n", lut_data->minimum);
+#endif
 }
 
 static ssize_t kcal_enable_store(struct device *dev,
@@ -624,13 +1220,19 @@ static ssize_t kcal_enable_store(struct device *dev,
 #endif
 
 	lut_data->enable = kcal_enable;
+	
+	// if kcal gets disabled, reset colors to normal.
+	if (!kcal_enable) {
+		lut_data->red = 256;
+		lut_data->green = 256;
+		lut_data->blue = 256;
+	}
 
-	if (mdss_mdp_kcal_is_panel_on()) {
-		mdss_mdp_kcal_update_pcc(lut_data);
-		mdss_mdp_kcal_update_pa(lut_data);
-		mdss_mdp_kcal_update_igc(lut_data);
-	} else
-		lut_data->queue_changes = true;
+
+	mdss_mdp_kcal_update_pcc(lut_data);
+	mdss_mdp_kcal_update_pa(lut_data);
+	mdss_mdp_kcal_update_igc(lut_data);
+	mdss_mdp_kcal_display_commit();
 
 	return count;
 }
@@ -660,10 +1262,8 @@ static ssize_t kcal_invert_store(struct device *dev,
 
 	lut_data->invert = kcal_invert;
 
-	if (mdss_mdp_kcal_is_panel_on())
-		mdss_mdp_kcal_update_igc(lut_data);
-	else
-		lut_data->queue_changes = true;
+	mdss_mdp_kcal_update_igc(lut_data);
+	mdss_mdp_kcal_display_commit();
 
 	return count;
 }
@@ -673,7 +1273,6 @@ static ssize_t kcal_invert_show(struct device *dev,
 {
 	struct kcal_lut_data *lut_data = dev_get_drvdata(dev);
 
-	/* IGC lut does not support reading regs in kernel space yet */
 
 	return scnprintf(buf, PAGE_SIZE, "%d\n", lut_data->invert);
 }
@@ -685,8 +1284,8 @@ static ssize_t kcal_sat_store(struct device *dev,
 	struct kcal_lut_data *lut_data = dev_get_drvdata(dev);
 
 	r = kstrtoint(buf, 10, &kcal_sat);
-	if ((r) || ((kcal_sat < 224 || kcal_sat > 383) && kcal_sat != 128))
-		return -EINVAL;
+	//if ((r) || ((kcal_sat < 224 || kcal_sat > 383) && kcal_sat != 128))
+	//	return -EINVAL;
 
 #ifdef CONFIG_PLASMA
 	kcal_sat_saved = kcal_sat;
@@ -694,10 +1293,8 @@ static ssize_t kcal_sat_store(struct device *dev,
 	
 	lut_data->sat = kcal_sat;
 
-	if (mdss_mdp_kcal_is_panel_on())
-		mdss_mdp_kcal_update_pa(lut_data);
-	else
-		lut_data->queue_changes = true;
+	mdss_mdp_kcal_update_pa(lut_data);
+	mdss_mdp_kcal_display_commit();
 
 	return count;
 }
@@ -726,10 +1323,8 @@ static ssize_t kcal_hue_store(struct device *dev,
 
 	lut_data->hue = kcal_hue;
 
-	if (mdss_mdp_kcal_is_panel_on())
-		mdss_mdp_kcal_update_pa(lut_data);
-	else
-		lut_data->queue_changes = true;
+	mdss_mdp_kcal_update_pa(lut_data);
+	mdss_mdp_kcal_display_commit();
 
 	return count;
 }
@@ -754,10 +1349,8 @@ static ssize_t kcal_val_store(struct device *dev,
 
 	lut_data->val = kcal_val;
 
-	if (mdss_mdp_kcal_is_panel_on())
-		mdss_mdp_kcal_update_pa(lut_data);
-	else
-		lut_data->queue_changes = true;
+	mdss_mdp_kcal_update_pa(lut_data);
+	mdss_mdp_kcal_display_commit();
 
 	return count;
 }
@@ -782,10 +1375,8 @@ static ssize_t kcal_cont_store(struct device *dev,
 
 	lut_data->cont = kcal_cont;
 
-	if (mdss_mdp_kcal_is_panel_on())
-		mdss_mdp_kcal_update_pa(lut_data);
-	else
-		lut_data->queue_changes = true;
+	mdss_mdp_kcal_update_pa(lut_data);
+	mdss_mdp_kcal_display_commit();
 
 	return count;
 }
@@ -796,6 +1387,62 @@ static ssize_t kcal_cont_show(struct device *dev,
 	struct kcal_lut_data *lut_data = dev_get_drvdata(dev);
 
 	return scnprintf(buf, PAGE_SIZE, "%d\n", lut_data->cont);
+}
+
+static ssize_t kcal_commit_wait_store(struct device *dev, struct device_attribute *attr,
+									  const char *buf, size_t count)
+{
+	int data, r;
+	
+	r = sscanf(buf, "%d", &data);
+	
+	if (r == 1 && data >= 0)
+		kcal_commit_wait = data;
+	
+	return count;
+}
+
+static ssize_t kcal_commit_wait_show(struct device *dev, struct device_attribute *attr,
+									 char *buf)
+{
+	return scnprintf(buf, PAGE_SIZE, "%d\n", kcal_commit_wait);
+}
+
+static ssize_t kcal_nightmode_r_store(struct device *dev, struct device_attribute *attr,
+									  const char *buf, size_t count)
+{
+	int data, r;
+	
+	r = sscanf(buf, "%d", &data);
+	
+	if (r == 1) {
+		if (data < 0)
+			kcal_nightmode_r = 0;
+		else if (data > 256)
+			kcal_nightmode_r = 256;
+		else
+			kcal_nightmode_r = data;
+		
+		// if nightmode is on, push the update now.
+		if (kcal_nightmode_r
+			&& kcal_nightmode_togglestate
+			&& !flg_power_suspended
+			&& dev_lut_data->red != kcal_nightmode_r) {
+			
+			dev_lut_data->red = kcal_nightmode_r;
+			
+			mdss_mdp_kcal_update_pcc(dev_lut_data);
+			mdss_mdp_kcal_display_commit();
+		}
+	}
+	
+	return count;
+}
+
+static ssize_t kcal_nightmode_r_show(struct device *dev, struct device_attribute *attr,
+									 char *buf)
+{
+	return scnprintf(buf, PAGE_SIZE, "%d\n", kcal_nightmode_r);
 }
 
 static DEVICE_ATTR(kcal, S_IWUSR | S_IRUGO, kcal_show, kcal_store);
@@ -809,39 +1456,10 @@ static DEVICE_ATTR(kcal_hue, S_IWUSR | S_IRUGO, kcal_hue_show, kcal_hue_store);
 static DEVICE_ATTR(kcal_val, S_IWUSR | S_IRUGO, kcal_val_show, kcal_val_store);
 static DEVICE_ATTR(kcal_cont, S_IWUSR | S_IRUGO, kcal_cont_show,
 	kcal_cont_store);
-
-static int mdss_mdp_kcal_update_queue(struct device *dev)
-{
-	struct kcal_lut_data *lut_data = dev_get_drvdata(dev);
-
-	if (lut_data->queue_changes) {
-		mdss_mdp_kcal_update_pcc(lut_data);
-		mdss_mdp_kcal_update_pa(lut_data);
-		mdss_mdp_kcal_update_igc(lut_data);
-		lut_data->queue_changes = false;
-	}
-
-	return 0;
-}
-
-#if defined(CONFIG_FB) && !defined(CONFIG_MMI_PANEL_NOTIFICATIONS)
-static int fb_notifier_callback(struct notifier_block *nb,
-	unsigned long event, void *data)
-{
-	int *blank;
-	struct fb_event *evdata = data;
-	struct kcal_lut_data *lut_data =
-		container_of(nb, struct kcal_lut_data, panel_nb);
-
-	if (evdata && evdata->data && event == FB_EVENT_BLANK) {
-		blank = evdata->data;
-		if (*blank == FB_BLANK_UNBLANK)
-			mdss_mdp_kcal_update_queue(&lut_data->dev);
-	}
-
-	return 0;
-}
-#endif
+static DEVICE_ATTR(kcal_commit_wait, S_IWUSR | S_IRUGO, kcal_commit_wait_show,
+				   kcal_commit_wait_store);
+static DEVICE_ATTR(kcal_nightmode_r, S_IWUSR | S_IRUGO, kcal_nightmode_r_show,
+				   kcal_nightmode_r_store);
 
 static int kcal_ctrl_probe(struct platform_device *pdev)
 {
@@ -874,33 +1492,14 @@ static int kcal_ctrl_probe(struct platform_device *pdev)
 	kcal_b_saved = lut_data->blue;
 	kcal_enable_saved = lut_data->enable;
 	kcal_sat_saved = lut_data->sat;
+	kcal_min_saved = lut_data->minimum;
 	dev_lut_data = lut_data;
 #endif
-
-	lut_data->queue_changes = false;
 
 	mdss_mdp_kcal_update_pcc(lut_data);
 	mdss_mdp_kcal_update_pa(lut_data);
 	mdss_mdp_kcal_update_igc(lut_data);
-
-#if defined(CONFIG_MMI_PANEL_NOTIFICATIONS)
-	lut_data->panel_nb.display_on = mdss_mdp_kcal_update_queue;
-	lut_data->panel_nb.dev = &pdev->dev;
-	ret = mmi_panel_register_notifier(&lut_data->panel_nb);
-	if (ret) {
-		pr_err("%s: unable to register MMI notifier\n", __func__);
-		return ret;
-	}
-#elif defined(CONFIG_FB)
-	lut_data->dev = pdev->dev;
-	lut_data->panel_nb.notifier_call = fb_notifier_callback;
-	ret = fb_register_client(&lut_data->panel_nb);
-	if (ret) {
-		pr_err("%s: unable to register fb notifier\n", __func__);
-		return ret;
-	}
-#endif
-
+	mdss_mdp_kcal_display_commit();
 	ret = device_create_file(&pdev->dev, &dev_attr_kcal);
 	ret |= device_create_file(&pdev->dev, &dev_attr_kcal_min);
 	ret |= device_create_file(&pdev->dev, &dev_attr_kcal_enable);
@@ -909,25 +1508,20 @@ static int kcal_ctrl_probe(struct platform_device *pdev)
 	ret |= device_create_file(&pdev->dev, &dev_attr_kcal_hue);
 	ret |= device_create_file(&pdev->dev, &dev_attr_kcal_val);
 	ret |= device_create_file(&pdev->dev, &dev_attr_kcal_cont);
+	ret |= device_create_file(&pdev->dev, &dev_attr_kcal_commit_wait);
+	ret |= device_create_file(&pdev->dev, &dev_attr_kcal_nightmode_r);
 	if (ret) {
 		pr_err("%s: unable to create sysfs entries\n", __func__);
-		goto out_notifier;
+		return ret;
 	}
+	
+	mdata_ff = mdss_mdp_get_mdata();
 
 	return 0;
-
-out_notifier:
-#if defined(CONFIG_MMI_PANEL_NOTIFICATIONS)
-	mmi_panel_unregister_notifier(&lut_data->panel_nb);
-#elif defined(CONFIG_FB)
-	fb_unregister_client(&lut_data->panel_nb);
-#endif
-	return ret;
 }
 
 static int kcal_ctrl_remove(struct platform_device *pdev)
 {
-	struct kcal_lut_data *lut_data = platform_get_drvdata(pdev);
 
 	device_remove_file(&pdev->dev, &dev_attr_kcal);
 	device_remove_file(&pdev->dev, &dev_attr_kcal_min);
@@ -937,12 +1531,8 @@ static int kcal_ctrl_remove(struct platform_device *pdev)
 	device_remove_file(&pdev->dev, &dev_attr_kcal_hue);
 	device_remove_file(&pdev->dev, &dev_attr_kcal_val);
 	device_remove_file(&pdev->dev, &dev_attr_kcal_cont);
-
-#if defined(CONFIG_MMI_PANEL_NOTIFICATIONS)
-	mmi_panel_unregister_notifier(&lut_data->panel_nb);
-#elif defined(CONFIG_FB)
-	fb_unregister_client(&lut_data->panel_nb);
-#endif
+	device_remove_file(&pdev->dev, &dev_attr_kcal_commit_wait);
+	device_remove_file(&pdev->dev, &dev_attr_kcal_nightmode_r);
 
 	return 0;
 }
@@ -966,6 +1556,15 @@ static int __init kcal_ctrl_init(void)
 
 	if (platform_device_register(&kcal_ctrl_device))
 		return -ENODEV;
+	
+#ifdef CONFIG_PLASMA
+	wq_kcal = alloc_workqueue("wq_kcal", WQ_HIGHPRI, 0);
+	wq_kcal_commit = alloc_workqueue("wq_kcal_commit", WQ_HIGHPRI, 0);
+	INIT_WORK(&work_kcal_commit, kcal_commit_work);
+	INIT_WORK(&work_kcal_fadein, kcal_fadein_work);
+	INIT_WORK(&work_kcal_fadeout, kcal_fadeout_work);
+	init_waitqueue_head(&waitq_kcal_commit);
+#endif
 
 	pr_info("%s: registered\n", __func__);
 
@@ -976,7 +1575,11 @@ static void __exit kcal_ctrl_exit(void)
 {
 	platform_device_unregister(&kcal_ctrl_device);
 	platform_driver_unregister(&kcal_ctrl_driver);
+#ifdef CONFIG_PLASMA
+	destroy_workqueue(wq_kcal);
+	destroy_workqueue(wq_kcal_commit);
+#endif
 }
 
-late_initcall(kcal_ctrl_init);
+module_init(kcal_ctrl_init);
 module_exit(kcal_ctrl_exit);

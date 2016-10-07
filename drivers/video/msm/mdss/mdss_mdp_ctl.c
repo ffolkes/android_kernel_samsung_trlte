@@ -30,6 +30,8 @@
 #undef MDSS_BW_DEBUG
 
 extern bool flg_kcal_needs_write;
+extern unsigned int kcal_commit_wait;
+extern wait_queue_head_t waitq_kcal_commit;
 
 static void mdss_mdp_xlog_mixer_reg(struct mdss_mdp_ctl *ctl);
 static inline u64 fudge_factor(u64 val, u32 numer, u32 denom)
@@ -3030,13 +3032,18 @@ int mdss_mdp_display_commit(struct mdss_mdp_ctl *ctl, void *arg,
 		pr_err("display function not set\n");
 		return -ENODEV;
 	}
+	
+	if (flg_kcal_needs_write) {
+		flg_kcal_needs_write = false;
+		//pr_info("[mdss_mdp_display_commit] waking kcal commit\n");
+		if (kcal_commit_wait >= 100)
+			wake_up_interruptible(&waitq_kcal_commit);
+	}
 
 	// use a trylock to reduce tearing when kcal is injecting commits.
 	// don't bother indenting, as that will make git think this whole section changed.
 	if (mutex_trylock(&ctl->lock)) {
 	pr_debug("commit ctl=%d play_cnt=%d\n", ctl->num, ctl->play_cnt);
-
-	flg_kcal_needs_write = false;
 
 	if (!mdss_mdp_ctl_is_power_on(ctl)) {
 		mutex_unlock(&ctl->lock);
