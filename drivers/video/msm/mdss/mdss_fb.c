@@ -45,6 +45,7 @@
 #include <linux/sw_sync.h>
 #include <linux/file.h>
 #include <linux/kthread.h>
+#include <linux/sched/rt.h>
 
 #include <mach/board.h>
 #include <mach/memory.h>
@@ -70,6 +71,12 @@ DEFINE_MUTEX(FB_BLANK_SUB);
 #endif
 
 #define MAX_FBI_LIST 32
+
+struct msm_fb_data_type *plasma_mfd = NULL;
+struct fb_info *plasma_fb_info = NULL;
+//static bool flg_fb_suspended = false;
+//extern bool flg_plasma_nocommits;
+//extern int flg_ctr_plasma_forcecommits;
 
 extern int boot_mode_recovery;
 
@@ -338,17 +345,6 @@ static ssize_t mdss_fb_store_split(struct device *dev,
 	return len;
 }
 
-static ssize_t mdss_fb_show_split(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	ssize_t ret = 0;
-	struct fb_info *fbi = dev_get_drvdata(dev);
-	struct msm_fb_data_type *mfd = (struct msm_fb_data_type *)fbi->par;
-	ret = snprintf(buf, PAGE_SIZE, "%d %d\n",
-		       mfd->split_fb_left, mfd->split_fb_right);
-	return ret;
-}
-
 static void mdss_fb_get_split(struct msm_fb_data_type *mfd)
 {
 	if (mfd->index != 0)
@@ -360,6 +356,22 @@ static void mdss_fb_get_split(struct msm_fb_data_type *mfd)
 	if (mfd->split_fb_left || mfd->split_fb_right)
 		pr_debug("split framebuffer left=%d right=%d\n",
 			mfd->split_fb_left, mfd->split_fb_right);
+}
+
+static ssize_t mdss_fb_show_split(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	ssize_t ret = 0;
+	struct fb_info *fbi = dev_get_drvdata(dev);
+	struct msm_fb_data_type *mfd = (struct msm_fb_data_type *)fbi->par;
+
+	if((mfd->split_fb_left == 0) && (mfd->split_fb_right == 0)){
+		printk("No split info => set as split info\n");
+		mdss_fb_get_split(mfd);
+	}
+	ret = snprintf(buf, PAGE_SIZE, "%d %d\n",
+		       mfd->split_fb_left, mfd->split_fb_right);
+	return ret;
 }
 
 static ssize_t mdss_mdp_show_blank_event(struct device *dev,
@@ -798,6 +810,8 @@ static int mdss_fb_suspend_sub(struct msm_fb_data_type *mfd)
 
 	if ((!mfd) || (mfd->key != MFD_KEY))
 		return 0;
+	
+	pr_info("[mdss_fb/mdss_fb_suspend_sub] starting\n");
 
 	pr_debug("mdss_fb suspend index=%d\n", mfd->index);
 
@@ -925,6 +939,23 @@ static int mdss_fb_pm_resume(struct device *dev)
 	pm_runtime_enable(dev);
 
 	return mdss_fb_resume_sub(mfd);
+}
+
+void plasma_panel_suspend(int mode)
+{
+	pr_info("[mdss_fb/plasma_panel_suspend] starting, mode: %d\n", mode);
+	
+	/*if (mode > 0) {
+		if (!flg_fb_suspended) {
+			flg_fb_suspended = true;
+			mdss_fb_blank_sub(4, plasma_fb_info, 1);
+		}
+	} else {
+		if (flg_fb_suspended) {
+			flg_fb_suspended = false;
+			mdss_fb_blank_sub(0, plasma_fb_info, 1);
+		}
+	}*/
 }
 #endif
 
@@ -1088,6 +1119,7 @@ void mdss_fb_update_backlight(struct msm_fb_data_type *mfd)
 static int mdss_fb_start_disp_thread(struct msm_fb_data_type *mfd)
 {
 	int ret = 0;
+	cpumask_t cpumask;
 
 	pr_debug("%pS: start display thread fb%d\n",
 		__builtin_return_address(0), mfd->index);
@@ -1097,6 +1129,12 @@ static int mdss_fb_start_disp_thread(struct msm_fb_data_type *mfd)
 	atomic_set(&mfd->commits_pending, 0);
 	mfd->disp_thread = kthread_run(__mdss_fb_display_thread,
 				mfd, "mdss_fb%d", mfd->index);
+	
+	// affine thread to cpu 0+1 only.
+	cpumask_clear(&cpumask);
+	cpumask_set_cpu(0, &cpumask);
+	cpumask_set_cpu(1, &cpumask);
+	set_cpus_allowed(mfd->disp_thread, cpumask);
 
 	if (IS_ERR(mfd->disp_thread)) {
 		pr_err("ERROR: unable to start display thread %d\n",
@@ -1186,7 +1224,15 @@ static int mdss_fb_blank_sub(int blank_mode, struct fb_info *info,
 
 	if (mfd->dcm_state == DCM_ENTER)
 		return -EPERM;
-
+	
+	if (plasma_mfd == NULL && mfd->panel_info->fb_num == 0)
+		plasma_mfd = mfd;
+	
+	if (plasma_fb_info == NULL)
+		plasma_fb_info = info;
+	
+	pr_info("[mdss_fb/mdss_fb_blank_sub] blank_mode: %d, op_enable: %d\n", blank_mode, op_enable);
+	
 	pr_debug("%pS mode:%d\n", __builtin_return_address(0),
 		blank_mode);
 
@@ -2551,7 +2597,8 @@ static int __mdss_fb_display_thread(void *data)
 	 * realtime scheduling to process display updates and interact with
 	 * other real time and normal priority tasks
 	 */
-	param.sched_priority = 16;
+	//pr_info("mdss_fb priority set to %d minus 3\n", MAX_RT_PRIO);
+	param.sched_priority = 40;//MAX_RT_PRIO - 3;
 	ret = sched_setscheduler(current, SCHED_FIFO, &param);
 	if (ret)
 		pr_warn("set priority failed for fb%d display thread\n",
@@ -2561,15 +2608,25 @@ static int __mdss_fb_display_thread(void *data)
 		ATRACE_BEGIN(__func__);
 		ret = wait_event_interruptible(mfd->commit_wait_q,
 				(atomic_read(&mfd->commits_pending) ||
-				 kthread_should_stop()));
+				 kthread_should_stop()/* || flg_ctr_plasma_forcecommits > 0*/));
 
 		if (ret) {
-			pr_info("%s: interrupted", __func__);
+			pr_info("%s: interrupted\n", __func__);
 			continue;
 		}
 
 		if (kthread_should_stop())
 			break;
+		
+		/*if (flg_ctr_plasma_forcecommits > 0) {
+			pr_info("%s: forcing, flg_ctr_plasma_forcecommits: %d\n", __func__, flg_ctr_plasma_forcecommits);
+			flg_ctr_plasma_forcecommits--;
+			
+			pr_info("%s: commits_pending: %d\n", __func__, atomic_read(&mfd->commits_pending));
+			
+			if (atomic_read(&mfd->commits_pending) == 0)
+				atomic_inc(&mfd->commits_pending);
+		}*/
 
 		ret = __mdss_fb_perform_commit(mfd);
 		atomic_dec(&mfd->commits_pending);
@@ -3044,6 +3101,7 @@ static int mdss_fb_display_commit(struct fb_info *info,
 {
 	int ret;
 	struct mdp_display_commit disp_commit;
+	
 	ret = copy_from_user(&disp_commit, argp,
 			sizeof(disp_commit));
 	if (ret) {
