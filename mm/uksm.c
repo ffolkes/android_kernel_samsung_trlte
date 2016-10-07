@@ -73,11 +73,16 @@
 #include <asm/tlbflush.h>
 #include "internal.h"
 
+static unsigned int uksmcontrol_mode = 0;
+static void uksmcontrol_work(struct work_struct * work_uksmcontrol);
+static DECLARE_DELAYED_WORK(work_uksmcontrol, uksmcontrol_work);
+
 #ifdef CONFIG_X86
 #undef memcmp
 
 #ifdef CONFIG_X86_32
 #define memcmp memcmpx86_32
+
 /*
  * Compare 4-byte-aligned address s1 and s2, with length n
  */
@@ -4727,6 +4732,49 @@ void uksm_control(unsigned int state)
 	}
 }
 EXPORT_SYMBOL(uksm_control);
+
+static void uksmcontrol_work(struct work_struct * work_uksmcontrol)
+{
+	pr_info("uksm/%s] performing control work, uksm_run: %d, requesting: %d\n",
+			__func__, uksm_run_saved, uksmcontrol_mode);
+	
+	// is uksm really enabled (via sysfs)?
+	if (uksm_run_saved) {
+		
+		// do we already have what we want?
+		if (uksm_run == uksmcontrol_mode)
+			return;
+		
+		uksm_control(uksmcontrol_mode);
+	}
+}
+
+void uksm_control_delayed(unsigned int state, int delay_ms)
+{
+	// is uksm really enabled (via sysfs)?
+	if (uksm_run_saved) {
+		
+		// do we already have what we want?
+		if (uksm_run == state)
+			return;
+		
+		if (!delay_ms)
+			uksm_control(state);
+		else {
+			uksmcontrol_mode = state;
+			schedule_delayed_work_on(1, &work_uksmcontrol, msecs_to_jiffies(delay_ms));
+		}
+	}
+}
+EXPORT_SYMBOL(uksm_control_delayed);
+
+void uksm_control_cancel(void)
+{
+	// cancel pending delayed work.
+	cancel_delayed_work_sync(&work_uksmcontrol);
+	
+}
+EXPORT_SYMBOL(uksm_control_cancel);
 
 #ifdef CONFIG_MIGRATION
 /* Common ksm interface but may be specific to uksm */
